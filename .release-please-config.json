@@ -1,0 +1,20 @@
+{
+  "packages": {
+    ".": {
+      "package-name": "weaboo-api",
+      "release-type": "node",
+      "initial-version": "0.0.1",
+      "changelog-sections": [
+        { "type": "feat", "section": "Features", "hidden": false },
+        { "type": "fix", "section": "Bug Fixes", "hidden": false },
+        { "type": "optimize", "section": "Optimizations", "hidden": false },
+        { "type": "docs", "section": "Docs", "hidden": false },
+        { "type": "refactor", "section": "Refactors", "hidden": false },
+        { "type": "test", "section": "Tests", "hidden": false },
+        { "type": "style", "section": "Style", "hidden": false },
+        { "type": "chore", "section": "Chores", "hidden": true }
+      ],
+      "pull-request-title-pattern": "Release ${component} v${version}"
+    }
+  }
+}

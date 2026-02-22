@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+.DS_Store
+coverage/
+.idea/
+.vscode/
+*.swp
+*.swo
+.cache/
+
+# Internal Ledger - Company Secret
+AGENTS.md
+AGENTS.local.md
