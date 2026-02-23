@@ -1,14 +1,17 @@
-import { PORT, API_VERSION } from './config/constants'
+import { API_VERSION, PORT } from './config/constants'
 import { AnimeController } from './controllers/anime'
 import { HomeController } from './controllers/home'
+import { SearchController } from './controllers/search'
 import { loggerMiddleware } from './middleware/logger'
 import { Logger } from './utils/logger'
 
 const homeController = new HomeController()
 const animeController = new AnimeController()
+const searchController = new SearchController()
 
-// ── Route matcher for /api/v1/anime/:slug ────────────────────────────────────
+// ── Route matchers ────────────────────────────────────────────────────────────
 const ANIME_ROUTE_RE = new RegExp(`^/api/${API_VERSION}/anime/([^/]+)$`)
+const ANIME_BY_MAL_RE = new RegExp(`^/api/${API_VERSION}/anime/mal/(\\d+)$`)
 
 const server = Bun.serve({
   port: PORT,
@@ -23,6 +26,20 @@ const server = Bun.serve({
       // GET /api/v1/home — aggregate scraper
       if (path === `/api/${API_VERSION}/home`) {
         return await homeController.getHome()
+      }
+
+      // GET /api/v1/search?genre=<name|id>&page=<n>
+      if (path === `/api/${API_VERSION}/search`) {
+        return await searchController.searchByGenre(
+          url.searchParams.get('genre'),
+          url.searchParams.get('page')
+        )
+      }
+
+      // GET /api/v1/anime/mal/:malId — fetch by MAL ID (must come BEFORE :slug)
+      const malMatch = ANIME_BY_MAL_RE.exec(path)
+      if (malMatch !== null) {
+        return await animeController.getAnimeByMalId(malMatch[1])
       }
 
       // GET /api/v1/anime/:slug?provider=[samehadaku|animasu]
@@ -42,7 +59,9 @@ const server = Bun.serve({
             version: API_VERSION,
             endpoints: {
               home: `/api/${API_VERSION}/home`,
+              search: `/api/${API_VERSION}/search?genre=<name|id>&page=<n>`,
               anime: `/api/${API_VERSION}/anime/:slug?provider=[samehadaku|animasu]`,
+              animeByMalId: `/api/${API_VERSION}/anime/mal/:malId`,
             },
           }),
           {

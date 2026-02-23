@@ -25,7 +25,18 @@ const episodeCache = new Map<string, ProviderEpisodeList>()
  */
 function parseEpisodeLabel(rawLabel: string): { start: number; end: number } | null {
   // Strip "Episode", "Ep.", "EP" prefixes (case-insensitive)
-  const stripped = rawLabel.replace(/^(episode|ep\.?)\s*/i, '').trim()
+  let stripped = rawLabel.replace(/^(episode|ep\.?)\s*/i, '').trim()
+
+  // Strip trailing episode-finale markers: [END], [FIN], [TAMAT], [FINAL], etc.
+  stripped = stripped.replace(/\s*\[(end|fin|tamat|final|complete|完)\]/i, '').trim()
+
+  // Also strip anime title prefix before episode number, e.g. "Sakamoto Days Cour 2 Episode 11"
+  // Pattern: strip everything up to the last standalone number/range
+  // We do this by checking if there's still a title-like prefix before digits
+  const titlePrefixMatch = /^.+\s+(\d+(?:\s*[-–]\s*\d+)?)$/.exec(stripped)
+  if (titlePrefixMatch !== null) {
+    stripped = titlePrefixMatch[1]
+  }
 
   // Try range pattern: "115-120" or "115 - 120"
   const rangeMatch = /^(\d+)\s*[-–]\s*(\d+)$/.exec(stripped)

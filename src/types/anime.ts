@@ -142,6 +142,24 @@ export interface MappingApiResponse {
   error?: string
 }
 
+// ── Genre search response shapes ─────────────────────────────────────────────
+
+/** Single anime item returned by genre search */
+export interface GenreSearchItem {
+  mal_id: number
+  name: string
+  cover: string
+}
+
+export interface GenreSearchResponse {
+  success: boolean
+  genre_id: number
+  page: number
+  has_next_page: boolean
+  count: number
+  data: GenreSearchItem[]
+}
+
 // ── Multi-factor match result (internal) ─────────────────────────────────────
 
 export type MatchMethod = 'phash' | 'jikan_fuzzy' | 'jikan_exact' | 'none'

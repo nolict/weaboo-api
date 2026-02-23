@@ -2,6 +2,7 @@ import axios from 'axios'
 
 import { JIKAN_BASE_URL, TITLE_SIMILARITY_THRESHOLD } from '../config/constants'
 import type {
+  GenreSearchItem,
   JikanAnime,
   JikanAnimeFull,
   JikanFullResponse,
@@ -274,6 +275,43 @@ export async function getAnimeFullById(malId: number): Promise<JikanAnimeFull | 
  *
  * If either value is null (still-airing / unknown), we give benefit of doubt.
  */
+/**
+ * searchByGenre — Fetch a paginated list of anime for a given MAL genre ID.
+ * Uses Jikan /anime endpoint with genres filter.
+ * Returns 10 results per page as GenreSearchItem[].
+ */
+export async function searchByGenre(
+  genreId: number,
+  page: number = 1
+): Promise<{ items: GenreSearchItem[]; hasNextPage: boolean }> {
+  await jikanThrottle()
+  const url = `${JIKAN_BASE_URL}/anime`
+  Logger.debug(`🎭 Jikan genre search: genre_id=${genreId}, page=${page}`)
+
+  const response = await axios.get<JikanSearchResponse>(url, {
+    params: {
+      genres: genreId,
+      page,
+      limit: 10,
+      order_by: 'score',
+      sort: 'desc',
+      sfw: false,
+    },
+    timeout: 10_000,
+  })
+
+  const items = response.data.data.map((anime) => ({
+    mal_id: anime.mal_id,
+    name: anime.title,
+    cover: anime.images.jpg.large_image_url ?? anime.images.jpg.image_url,
+  }))
+
+  return {
+    items,
+    hasNextPage: response.data.pagination.has_next_page,
+  }
+}
+
 export function validateMetadataMatch(
   jikanAnime: JikanAnime,
   scraped: { year: number | null; totalEpisodes: number | null },

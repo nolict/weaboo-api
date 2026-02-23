@@ -6,14 +6,14 @@ import {
   PROVIDERS,
   TITLE_SIMILARITY_THRESHOLD,
 } from '../config/constants'
-import { findMappingByPHash, upsertMapping } from '../lib/supabase'
+import { findMappingByMalId, findMappingByPHash, upsertMapping } from '../lib/supabase'
 import type { AnimeDetailScrape, AnimeMapping, JikanAnime, MatchResult } from '../types/anime'
 import { fetchHTML } from '../utils/fetcher'
 import { Logger } from '../utils/logger'
 import { AnimeNormalizer } from '../utils/normalizer'
 
 import { generatePHash } from './image'
-import { getAnimeById, searchByTitle, validateMetadataMatch } from './jikan'
+import { getAnimeById, getAnimeFullById, searchByTitle, validateMetadataMatch } from './jikan'
 
 // ── In-memory Request Lock ────────────────────────────────────────────────────
 // Prevents multiple concurrent requests for the same slug from each triggering
@@ -159,8 +159,16 @@ function isCoverUrlValid(coverUrl: string, targetProvider: 'samehadaku' | 'anima
  */
 async function searchProviderForSlug(
   query: string,
-  targetProvider: 'samehadaku' | 'animasu'
-): Promise<Array<{ slug: string; coverUrl: string; cardTitle: string }>> {
+  targetProvider: 'samehadaku' | 'animasu',
+  trustSearchEngine: boolean = false
+): Promise<
+  Array<{
+    slug: string
+    coverUrl: string
+    cardTitle: string
+    skipTitleFilter: boolean
+  }>
+> {
   const baseUrl =
     targetProvider === 'animasu' ? PROVIDERS.ANIMASU.baseUrl : PROVIDERS.SAMEHADAKU.baseUrl
 
@@ -171,7 +179,12 @@ async function searchProviderForSlug(
     const html = await fetchHTML(searchUrl)
     const $ = cheerio.load(html)
 
-    const results: Array<{ slug: string; coverUrl: string; cardTitle: string }> = []
+    const results: Array<{
+      slug: string
+      coverUrl: string
+      cardTitle: string
+      skipTitleFilter: boolean
+    }> = []
 
     // Animasu uses .bs card structure; Samehadaku uses .animpost on search pages.
     // We handle both selectors and extract title/slug/cover from each.
@@ -200,7 +213,7 @@ async function searchProviderForSlug(
         const slug = parts[parts.length - 1] ?? ''
 
         if (slug !== '' && isCoverUrlValid(img, targetProvider)) {
-          results.push({ slug, coverUrl: img, cardTitle })
+          results.push({ slug, coverUrl: img, cardTitle, skipTitleFilter: false })
         }
       } catch {
         // skip malformed URLs
@@ -208,6 +221,15 @@ async function searchProviderForSlug(
     })
 
     Logger.debug(`  Found ${results.length} candidate(s) on ${targetProvider}`)
+
+    // If trustSearchEngine is set and we got a small, specific result set,
+    // mark all candidates to skip the card-title pre-filter.
+    // Samehadaku search with a long romaji query is precise enough that even
+    // results with short/abbrev card titles (e.g. "Yuukawa") are correct matches.
+    if (trustSearchEngine && results.length <= 3) {
+      return results.map((r) => ({ ...r, skipTitleFilter: true }))
+    }
+
     return results
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
@@ -291,8 +313,15 @@ async function discoverOppositeSlug(
 
   const { hammingDistance } = await import('./image')
 
-  for (const query of queryTitles) {
-    const candidates = await searchProviderForSlug(query, targetProvider)
+  for (let qIdx = 0; qIdx < queryTitles.length; qIdx++) {
+    const query = queryTitles[qIdx]
+
+    // For Samehadaku: when the query is the romaji/full title (index ≥ 2 in query list,
+    // i.e. the more specific queries), trust the search engine if ≤ 3 results come back —
+    // Samehadaku indexes by full title so even short-slug entries will appear.
+    // In this case we skip the card title pre-filter and go straight to detail scrape.
+    const isSpecificRomajiQuery = targetProvider === 'samehadaku' && qIdx >= 2
+    const candidates = await searchProviderForSlug(query, targetProvider, isSpecificRomajiQuery)
 
     for (const candidate of candidates) {
       Logger.debug(
@@ -303,7 +332,12 @@ async function discoverOppositeSlug(
       // Before doing any network calls (pHash download, detail scrape),
       // verify the search result card title is similar enough to MAL title.
       // This prevents wasting time on obviously wrong results.
-      if (candidate.cardTitle !== '') {
+      //
+      // EXCEPTION: if candidate.skipTitleFilter is true (set when the query is a
+      // specific romaji title on Samehadaku with ≤ 3 results), we trust the search
+      // engine and skip the card-title check — Samehadaku often uses short/abbrev
+      // titles on cards (e.g. "Yuukawa") even when the full title matches perfectly.
+      if (!candidate.skipTitleFilter && candidate.cardTitle !== '') {
         const cleanedCard = AnimeNormalizer.cleanTitle(candidate.cardTitle)
         const malTitleEn = AnimeNormalizer.cleanTitle(jikanAnime.title_english ?? jikanAnime.title)
         const malTitleRo = AnimeNormalizer.cleanTitle(jikanAnime.title)
@@ -325,6 +359,10 @@ async function discoverOppositeSlug(
           Logger.debug(`  Card title mismatch — skipping ${candidate.slug}`)
           continue
         }
+      } else if (candidate.skipTitleFilter) {
+        Logger.debug(
+          `  Card title filter skipped (specific romaji query, ≤ few results) — going to detail scrape`
+        )
       }
 
       // ── Step A: pHash comparison using search thumbnail ─────────────────
@@ -716,14 +754,127 @@ async function runDiscovery(
   return mapping
 }
 
-// ── Public entrypoint (with Request Lock) ─────────────────────────────────────
+// ── MAL-ID-first discovery ────────────────────────────────────────────────────
+
+/**
+ * runDiscoveryByMalId — Entry point when we already know the MAL ID.
+ *
+ * Strategy:
+ *  1. Check Supabase — return cached mapping immediately if found.
+ *  2. Fetch MAL title from Jikan (getAnimeFullById).
+ *  3. Use MAL title variants to search BOTH providers (Samehadaku + Animasu)
+ *     via the same discoverOppositeSlug logic — treating "no source" as a
+ *     two-sided discovery.
+ *  4. Upsert and return the new mapping.
+ */
+async function runDiscoveryByMalId(malId: number): Promise<AnimeMapping | null> {
+  Logger.info(`🚀 Starting MAL-ID enrichment for mal_id=${malId}`)
+
+  // ── Step 1: Supabase cache check ─────────────────────────────────────────
+  const cached = await findMappingByMalId(malId)
+  if (cached !== null) {
+    Logger.success(`⚡ Mapping cache hit for mal_id=${malId}`)
+    return cached
+  }
+
+  // ── Step 2: Fetch MAL metadata from Jikan ────────────────────────────────
+  const malAnime = await getAnimeFullById(malId)
+  if (malAnime === null) {
+    Logger.warning(`⚠️  Could not fetch Jikan data for mal_id=${malId}`)
+    return null
+  }
+
+  Logger.info(
+    `📄 Jikan: "${malAnime.title}" (year=${malAnime.year ?? '?'}, eps=${malAnime.episodes ?? '?'})`
+  )
+
+  // Build a JikanAnime-shaped object to reuse discoverOppositeSlug
+  const jikanAnime: JikanAnime = {
+    mal_id: malAnime.mal_id,
+    title: malAnime.title,
+    title_english: malAnime.title_english,
+    title_japanese: malAnime.title_japanese,
+    episodes: malAnime.episodes,
+    year: malAnime.year,
+    images: malAnime.images,
+  }
+
+  // ── Step 3: Discover slugs on both providers ──────────────────────────────
+  // We search Samehadaku first (more reliable full-title search per spec),
+  // then use the Samehadaku pHash to assist Animasu discovery.
+  Logger.info(`🔎 Searching Samehadaku for mal_id=${malId} ("${malAnime.title}")`)
+  const samehadakuResult = await discoverOppositeSlug(jikanAnime, 'animasu', null)
+  // discoverOppositeSlug(source='animasu') → searches samehadaku
+
+  const slugSamehadaku: string | null = samehadakuResult?.slug ?? null
+  let sourcePHash: string | null = samehadakuResult?.phash ?? null
+
+  // If we got a Samehadaku slug, generate its pHash to assist Animasu discovery
+  if (slugSamehadaku !== null && sourcePHash === null) {
+    const detail = await scrapeSamehadakuDetail(slugSamehadaku)
+    if (detail !== null) {
+      sourcePHash = await generatePHash(detail.coverUrl)
+    }
+  }
+
+  Logger.info(`🔎 Searching Animasu for mal_id=${malId} ("${malAnime.title}")`)
+  const animasuResult = await discoverOppositeSlug(jikanAnime, 'samehadaku', sourcePHash)
+  // discoverOppositeSlug(source='samehadaku') → searches animasu
+
+  const slugAnimasu: string | null = animasuResult?.slug ?? null
+  const finalPHash = sourcePHash ?? animasuResult?.phash ?? null
+
+  if (slugSamehadaku === null && slugAnimasu === null) {
+    Logger.warning(`⚠️  Could not find any provider slug for mal_id=${malId}`)
+    // Still upsert a partial mapping so MAL metadata is cached
+  }
+
+  // ── Step 4: Upsert mapping ────────────────────────────────────────────────
+  const mapping = await upsertMapping({
+    malId: malAnime.mal_id,
+    titleMain: malAnime.title,
+    slugSamehadaku,
+    slugAnimasu,
+    phashV1: finalPHash,
+    releaseYear: malAnime.year,
+    totalEpisodes: malAnime.episodes,
+  })
+
+  Logger.success(
+    `💾 Mapping saved (by MAL ID): mal_id=${mapping.mal_id} | ` +
+      `samehadaku=${mapping.slug_samehadaku ?? '-'} | animasu=${mapping.slug_animasu ?? '-'}`
+  )
+
+  return mapping
+}
+
+// ── Public entrypoints (with Request Lock) ───────────────────────────────────
+
+/**
+ * resolveMappingByMalId — Public entrypoint for MAL-ID-first lookup.
+ * Uses a Request Lock keyed by mal_id to prevent duplicate concurrent jobs.
+ */
+export async function resolveMappingByMalId(malId: number): Promise<AnimeMapping | null> {
+  const lockKey = `mal:${malId}`
+
+  const existing = enrichmentLocks.get(lockKey)
+  if (existing !== undefined) {
+    Logger.debug(`⏳ Request lock active for ${lockKey} — awaiting existing job`)
+    return await existing
+  }
+
+  const job = runDiscoveryByMalId(malId).finally(() => {
+    enrichmentLocks.delete(lockKey)
+  })
+
+  enrichmentLocks.set(lockKey, job)
+  return await job
+}
 
 /**
  * resolveMapping — Public entrypoint used by the controller.
- *
- * Implements the Request Lock pattern: if a concurrent request for the same
- * slug is already running the Enrichment Phase, subsequent callers await the
- * same Promise instead of spawning duplicate discovery jobs.
+ * Implements the Request Lock pattern: subsequent callers for the same slug
+ * await the same Promise instead of spawning duplicate discovery jobs.
  */
 export async function resolveMapping(
   slug: string,

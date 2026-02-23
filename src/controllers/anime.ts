@@ -1,7 +1,12 @@
-import { findMalMetadata, findMappingBySlug, upsertMalMetadata } from '../lib/supabase'
+import {
+  findMalMetadata,
+  findMappingByMalId,
+  findMappingBySlug,
+  upsertMalMetadata,
+} from '../lib/supabase'
 import { getEpisodeList } from '../services/episodes'
 import { getAnimeFullById } from '../services/jikan'
-import { resolveMapping } from '../services/mapping'
+import { resolveMapping, resolveMappingByMalId } from '../services/mapping'
 import type { AnimeDetailResponse, MappingApiResponse } from '../types/anime'
 import { Logger } from '../utils/logger'
 
@@ -118,6 +123,84 @@ export class AnimeController {
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error'
       Logger.error(`❌ AnimeController error for ${provider}/${cleanSlug}:`, error)
+      return this.errorResponse(500, msg)
+    }
+  }
+
+  /**
+   * GET /api/v1/anime/mal/:malId
+   *
+   * Fetch anime detail by MAL ID — identical response shape as getAnime().
+   *
+   * Flow:
+   *  1. Check Supabase for an existing mapping by mal_id (fast path).
+   *  2. On cache miss → resolveMappingByMalId() which fetches MAL title from
+   *     Jikan then searches both providers to discover slugs.
+   *  3. Fetch MAL full metadata + episode lists — same as slug-based flow.
+   */
+  async getAnimeByMalId(rawMalId: string): Promise<Response> {
+    const malId = parseInt(rawMalId, 10)
+    if (isNaN(malId) || malId <= 0) {
+      return this.errorResponse(400, `Invalid MAL ID "${rawMalId}" — must be a positive integer.`)
+    }
+
+    Logger.info(`📥 GET /anime/mal/${malId}`)
+
+    try {
+      // ── Step 1: Resolve mapping (Supabase cache or fresh enrichment) ─────────
+      let mappingCached = false
+      let mapping = await findMappingByMalId(malId)
+
+      if (mapping !== null) {
+        Logger.success(`⚡ Mapping cache hit: mal_id=${malId} → "${mapping.title_main}"`)
+        mappingCached = true
+      } else {
+        Logger.info(`🔄 Cache miss for mal_id=${malId} — starting enrichment`)
+        mapping = await resolveMappingByMalId(malId)
+
+        if (mapping === null) {
+          return this.errorResponse(
+            404,
+            `Could not resolve mapping for mal_id=${malId}. ` +
+              `The anime may not exist on MAL or could not be found on any provider.`
+          )
+        }
+      }
+
+      // ── Step 2: MAL full metadata ─────────────────────────────────────────────
+      Logger.debug(`🗄️  Checking Supabase MAL metadata for mal_id=${malId}`)
+      let malMeta = await findMalMetadata(malId)
+
+      if (malMeta !== null) {
+        Logger.debug(`⚡ MAL metadata cache hit (Supabase) for mal_id=${malId}`)
+      } else {
+        Logger.debug(`🌐 Cache miss — fetching MAL metadata from Jikan for mal_id=${malId}`)
+        malMeta = await getAnimeFullById(malId)
+
+        if (malMeta !== null) {
+          upsertMalMetadata(malMeta).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err)
+            Logger.warning(`⚠️  Failed to persist MAL metadata to Supabase: ${msg}`)
+          })
+          Logger.debug(`📌 MAL metadata saved to Supabase for mal_id=${malId}`)
+        } else {
+          Logger.warning(`⚠️  MAL full metadata unavailable for mal_id=${malId}`)
+        }
+      }
+
+      // ── Step 3: Episode lists ─────────────────────────────────────────────────
+      Logger.debug(
+        `📺 Fetching episodes — animasu: ${mapping.slug_animasu ?? 'n/a'}, ` +
+          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}`
+      )
+      const episodes = await getEpisodeList(mapping.slug_animasu, mapping.slug_samehadaku)
+
+      // ── Step 4: Compose response ──────────────────────────────────────────────
+      const detail: AnimeDetailResponse = { mapping, mal: malMeta, episodes }
+      return this.successResponse(detail, mappingCached)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error'
+      Logger.error(`❌ AnimeController error for mal_id=${malId}:`, error)
       return this.errorResponse(500, msg)
     }
   }
