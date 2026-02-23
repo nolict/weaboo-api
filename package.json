@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/sharp": "^0.32.0",
     "@typescript-eslint/eslint-plugin": "^6.21.0",
     "@typescript-eslint/parser": "^6.21.0",
     "eslint": "^8.56.0",
@@ -26,8 +27,11 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.97.0",
     "axios": "^1.13.5",
-    "cheerio": "^1.0.0-rc.12"
+    "cheerio": "^1.0.0-rc.12",
+    "fuse.js": "^7.1.0",
+    "sharp": "^0.34.5"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"

@@ -1,5 +1,17 @@
 import type { AnimeItem, NormalizedAnime } from '../types/anime'
 
+// ── Season/cour/part normalisation map ───────────────────────────────────────
+// Converts human-readable suffixes to a canonical ordinal form so that
+// "Sakamoto Days Cour 2" and "Sakamoto Days Part 2" both become
+// "Sakamoto Days 2" before comparison.
+const SEASON_ALIASES: Array<[RegExp, string]> = [
+  [/\bcour\s*(\d+)/gi, 'part $1'],
+  [/\bseason\s*(\d+)/gi, 'part $1'],
+  [/\b(\d+)(st|nd|rd|th)\s*season/gi, 'part $1'],
+  [/\bs(\d+)\b/gi, 'part $1'],
+  [/\bpart\s*(\d+)/gi, 'part $1'], // normalise existing "part N" too (trim whitespace)
+]
+
 export const AnimeNormalizer = {
   createCanonicalSlug(title: string): string {
     return title
@@ -70,6 +82,25 @@ export const AnimeNormalizer = {
     }
 
     return matrix[str2.length][str1.length]
+  },
+
+  /**
+   * normaliseSeason — Applies SEASON_ALIASES to produce a canonical title
+   * where all season/cour/part suffixes use the same "part N" form.
+   * Used before fuzzy-matching across providers and against Jikan.
+   *
+   * Examples:
+   *   "Sakamoto Days Cour 2"  → "Sakamoto Days part 2"
+   *   "Attack on Titan S4"    → "Attack on Titan part 4"
+   *   "Overlord 2nd Season"   → "Overlord part 2"
+   */
+  normaliseSeason(title: string): string {
+    let result = title.trim()
+    for (const [pattern, replacement] of SEASON_ALIASES) {
+      result = result.replace(pattern, replacement)
+    }
+    // Collapse extra whitespace that substitutions may introduce
+    return result.replace(/\s+/g, ' ').trim()
   },
 
   deduplicateAnime(items: AnimeItem[]): NormalizedAnime[] {

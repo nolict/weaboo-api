@@ -1,0 +1,676 @@
+import * as cheerio from 'cheerio'
+
+import {
+  EPISODE_COUNT_TOLERANCE,
+  PHASH_HAMMING_THRESHOLD,
+  PROVIDERS,
+  TITLE_SIMILARITY_THRESHOLD,
+} from '../config/constants'
+import { findMappingByPHash, upsertMapping } from '../lib/supabase'
+import type { AnimeDetailScrape, AnimeMapping, JikanAnime, MatchResult } from '../types/anime'
+import { fetchHTML } from '../utils/fetcher'
+import { Logger } from '../utils/logger'
+import { AnimeNormalizer } from '../utils/normalizer'
+
+import { generatePHash } from './image'
+import { getAnimeById, searchByTitle, validateMetadataMatch } from './jikan'
+
+// ── In-memory Request Lock ────────────────────────────────────────────────────
+// Prevents multiple concurrent requests for the same slug from each triggering
+// their own Enrichment Phase (which would hammer scrapers + Jikan).
+// The lock stores a Promise so subsequent callers simply await the first one.
+const enrichmentLocks = new Map<string, Promise<AnimeMapping | null>>()
+
+// ── Provider detail-page scrapers ─────────────────────────────────────────────
+
+/**
+ * Scrape a Samehadaku anime detail page.
+ * URL pattern: https://v1.samehadaku.how/anime/<slug>/
+ *
+ * Extracts: full title (H1), poster image, release year, episode count.
+ * The "Judul lengkap:" paragraph enrichment is re-used from SamehadakuProvider.
+ */
+async function scrapeAnimasuDetail(slug: string): Promise<AnimeDetailScrape | null> {
+  try {
+    const url = `${PROVIDERS.ANIMASU.baseUrl}/anime/${slug}/`
+    const html = await fetchHTML(url)
+    const $ = cheerio.load(html)
+
+    // Title: prefer .entry-title / h1, fallback to page <title>
+    const h1Entry = $('h1.entry-title').first().text().trim()
+    const h1Generic = $('h1').first().text().trim()
+    const titleTag = $('title').text().split('|')[0].trim()
+    const title = h1Entry !== '' ? h1Entry : h1Generic !== '' ? h1Generic : titleTag
+
+    // Cover: og:image is most reliable on Animasu
+    const coverUrl =
+      $('meta[property="og:image"]').attr('content') ??
+      $('img.attachment-post-thumbnail').attr('src') ??
+      ''
+
+    // Year: Animasu uses "Rilis: Jan 6, 2026" format in .spe span
+    let year: number | null = null
+    $('div.spe span').each((_, el) => {
+      const text = $(el).text().trim()
+      if (/^rilis:/i.test(text)) {
+        const match = /(\d{4})/.exec(text)
+        if (match !== null) year = parseInt(match[1], 10)
+      }
+    })
+
+    // Episodes: Animasu detail page does NOT show total episode count —
+    // only "Status: Sedang Tayang" is shown. Set null so metadata gate
+    // relies on year + title only.
+    const totalEpisodes: number | null = null
+
+    if (title === '' || coverUrl === '') return null
+
+    return { title, coverUrl, year, totalEpisodes, slug, provider: PROVIDERS.ANIMASU.name }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    Logger.warning(`⚠️  Failed to scrape Animasu detail (${slug}): ${msg}`)
+    return null
+  }
+}
+
+async function scrapeSamehadakuDetail(slug: string): Promise<AnimeDetailScrape | null> {
+  try {
+    const url = `${PROVIDERS.SAMEHADAKU.baseUrl}/anime/${slug}/`
+    const html = await fetchHTML(url)
+    const $ = cheerio.load(html)
+
+    // Full title from "Judul lengkap:" paragraph pattern (established in SamehadakuProvider)
+    let title = ''
+    const paragraphs = $('.entry-content p')
+    if (paragraphs.length >= 2) {
+      const p0 = $(paragraphs[0]).text().trim()
+      const p1 = $(paragraphs[1]).text().trim()
+      if (p0 === 'Judul lengkap:' && p1.length > 0) title = p1
+    }
+    // Fallback to H1
+    if (title === '') title = $('h1').first().text().trim()
+
+    const coverUrl =
+      $('meta[property="og:image"]').attr('content') ??
+      $('img.attachment-post-thumbnail').attr('src') ??
+      ''
+
+    // Year: Samehadaku uses "Released: Jan 6, 2026 to ?" format in .spe span
+    let year: number | null = null
+    $('div.spe span').each((_, el) => {
+      const text = $(el).text().trim()
+      if (/^released:/i.test(text)) {
+        const match = /(\d{4})/.exec(text)
+        if (match !== null) year = parseInt(match[1], 10)
+      }
+    })
+
+    // Episodes: Samehadaku uses "Total Episode 13" format (no colon)
+    let totalEpisodes: number | null = null
+    $('div.spe span').each((_, el) => {
+      const text = $(el).text().trim()
+      if (/^total\s+episode\s+\d+/i.test(text)) {
+        const match = /(\d+)$/.exec(text)
+        if (match !== null) totalEpisodes = parseInt(match[1], 10)
+      }
+    })
+
+    if (title === '' || coverUrl === '') return null
+
+    return { title, coverUrl, year, totalEpisodes, slug, provider: PROVIDERS.SAMEHADAKU.name }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    Logger.warning(`⚠️  Failed to scrape Samehadaku detail (${slug}): ${msg}`)
+    return null
+  }
+}
+
+// ── Cross-provider slug discovery ─────────────────────────────────────────────
+
+/**
+ * Validate that a scraped coverUrl actually belongs to the target provider
+ * and is not a fallback/default image (e.g. Linktree og:image, site logo).
+ *
+ * A valid cover must be hosted on the provider's own domain or a known
+ * CDN it uses (e.g. wp.com for WordPress-based sites).
+ */
+function isCoverUrlValid(coverUrl: string, targetProvider: 'samehadaku' | 'animasu'): boolean {
+  if (coverUrl === '') return false
+  try {
+    const { hostname } = new URL(coverUrl)
+    if (targetProvider === 'animasu') {
+      // Animasu uses WordPress — images served via i0.wp.com / i1.wp.com / i2.wp.com
+      return hostname.includes('animasu') || hostname.endsWith('wp.com')
+    }
+    // Samehadaku images hosted on their own domain or CDN
+    return hostname.includes('samehadaku') || hostname.endsWith('wp.com')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * searchProviderForSlug — Queries the WordPress search endpoint of a provider
+ * to discover real slugs for a given title query.
+ *
+ * Both Animasu and Samehadaku are WordPress sites exposing /?s=<query>.
+ * Search results include real slugs + thumbnail covers — no slug guessing.
+ * We only return results whose cover URL passes the domain validity check.
+ */
+async function searchProviderForSlug(
+  query: string,
+  targetProvider: 'samehadaku' | 'animasu'
+): Promise<Array<{ slug: string; coverUrl: string; cardTitle: string }>> {
+  const baseUrl =
+    targetProvider === 'animasu' ? PROVIDERS.ANIMASU.baseUrl : PROVIDERS.SAMEHADAKU.baseUrl
+
+  const searchUrl = `${baseUrl}/?s=${encodeURIComponent(query)}`
+  Logger.debug(`  🔎 Provider search: ${searchUrl}`)
+
+  try {
+    const html = await fetchHTML(searchUrl)
+    const $ = cheerio.load(html)
+
+    const results: Array<{ slug: string; coverUrl: string; cardTitle: string }> = []
+
+    // Both providers use WordPress .bs card structure in search results.
+    // Extract title from a[title] attr or .tt div — whichever is available.
+    $('.bs').each((_, el) => {
+      const $el = $(el)
+      const $anchor = $el.find('a[title]').first()
+      const href = $anchor.attr('href') ?? $el.find('a').first().attr('href') ?? ''
+      const img =
+        $el.find('img').first().attr('src') ?? $el.find('img').first().attr('data-src') ?? ''
+
+      // Card title: prefer .tt (Japanese/original title), fallback to a[title]
+      const ttText = $el.find('.tt').first().text().trim()
+      const anchorTitle = $anchor.attr('title') ?? ''
+      const cardTitle = ttText !== '' ? ttText : anchorTitle
+
+      if (href === '' || img === '') return
+
+      try {
+        const urlObj = new URL(href)
+        const parts = urlObj.pathname.split('/').filter(Boolean)
+        const slug = parts[parts.length - 1] ?? ''
+
+        if (slug !== '' && isCoverUrlValid(img, targetProvider)) {
+          results.push({ slug, coverUrl: img, cardTitle })
+        }
+      } catch {
+        // skip malformed URLs
+      }
+    })
+
+    Logger.debug(`  Found ${results.length} candidate(s) on ${targetProvider}`)
+    return results
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    Logger.debug(`  Provider search failed on ${targetProvider}: ${msg}`)
+    return []
+  }
+}
+
+/**
+ * Given a confirmed MAL entry, attempt to find the *opposite* provider's slug.
+ *
+ * Strategy (Search-First):
+ *  1. Query the opposite provider's WordPress search with MAL title variants.
+ *  2. For each search result (real slug + thumbnail):
+ *     a. Compare thumbnail pHash against source pHash (Hamming < threshold) → ✅ match
+ *     b. Fallback: scrape detail page → validate metadata (year ±1, eps ±tolerance) → ✅ match
+ *
+ * Why search-first?
+ *  Slug formats differ wildly between providers (e.g. Samehadaku "yuukawa" vs
+ *  Animasu "yuusha-party-ni-kawaii-ko"). Guessing slugs from MAL titles is
+ *  unreliable. Search gives us the real slug + a valid thumbnail cover URL
+ *  without hitting an unknown detail page URL.
+ *
+ * Episode tolerance:
+ *  Simulcast providers may differ by 1–2 episodes. We use EPISODE_COUNT_TOLERANCE
+ *  as the allowed delta. `last_sync` in Supabase tells consumers when to re-check.
+ */
+async function discoverOppositeSlug(
+  jikanAnime: JikanAnime,
+  sourceProvider: 'samehadaku' | 'animasu',
+  sourcePHash: string | null
+): Promise<{ slug: string; phash: string | null } | null> {
+  const targetProvider = sourceProvider === 'samehadaku' ? 'animasu' : 'samehadaku'
+
+  // Build search query list — ordered from most specific to most lenient:
+  // 1. English title (e.g. "SI-VIS: The Sound of Heroes")
+  // 2. Romaji title  (e.g. "SI-VIS: The Sound of Heroes" — often same)
+  // 3. Pre-colon truncation (e.g. "SI-VIS") — for providers that use short slugs
+  // 4. First 3 words  (e.g. "SI-VIS The") — last resort broad search
+  const rawTitles = [jikanAnime.title_english, jikanAnime.title].filter(
+    (t): t is string => t !== null && t.length > 0
+  )
+
+  const queryTitles: string[] = []
+  const seen = new Set<string>()
+
+  for (const t of rawTitles) {
+    if (!seen.has(t)) {
+      seen.add(t)
+      queryTitles.push(t)
+    }
+
+    // If title contains colon, add the prefix as a separate shorter query
+    const colonIdx = t.indexOf(':')
+    if (colonIdx > 0) {
+      const prefix = t.slice(0, colonIdx).trim()
+      if (prefix.length > 1 && !seen.has(prefix)) {
+        seen.add(prefix)
+        queryTitles.push(prefix)
+      }
+    }
+
+    // First 3 words as fallback broad query (min 8 chars to avoid noise)
+    const firstThree = t.split(/\s+/).slice(0, 3).join(' ')
+    if (firstThree.length >= 8 && !seen.has(firstThree)) {
+      seen.add(firstThree)
+      queryTitles.push(firstThree)
+    }
+  }
+
+  Logger.info(`🔎 Discovering ${targetProvider} slug via search for: "${queryTitles[0] ?? ''}"`)
+
+  const { hammingDistance } = await import('./image')
+
+  for (const query of queryTitles) {
+    const candidates = await searchProviderForSlug(query, targetProvider)
+
+    for (const candidate of candidates) {
+      Logger.debug(
+        `  Candidate: ${targetProvider}/${candidate.slug} | card title: "${candidate.cardTitle}"`
+      )
+
+      // ── Pre-filter: card title similarity check ──────────────────────────
+      // Before doing any network calls (pHash download, detail scrape),
+      // verify the search result card title is similar enough to MAL title.
+      // This prevents wasting time on obviously wrong results.
+      if (candidate.cardTitle !== '') {
+        const cleanedCard = AnimeNormalizer.cleanTitle(candidate.cardTitle)
+        const malTitleEn = AnimeNormalizer.cleanTitle(jikanAnime.title_english ?? jikanAnime.title)
+        const malTitleRo = AnimeNormalizer.cleanTitle(jikanAnime.title)
+
+        const cardSim = Math.max(
+          AnimeNormalizer.calculateSimilarity(
+            AnimeNormalizer.normaliseSeason(cleanedCard),
+            AnimeNormalizer.normaliseSeason(malTitleEn)
+          ),
+          AnimeNormalizer.calculateSimilarity(
+            AnimeNormalizer.normaliseSeason(cleanedCard),
+            AnimeNormalizer.normaliseSeason(malTitleRo)
+          )
+        )
+
+        Logger.debug(`  Card title sim=${cardSim.toFixed(3)} for "${cleanedCard}"`)
+
+        if (cardSim < TITLE_SIMILARITY_THRESHOLD) {
+          Logger.debug(`  Card title mismatch — skipping ${candidate.slug}`)
+          continue
+        }
+      }
+
+      // ── Step A: pHash comparison using search thumbnail ─────────────────
+      // The thumbnail from search results IS the poster — valid cover, no
+      // detail page fetch needed. Compare directly against source pHash.
+      if (sourcePHash !== null) {
+        const candidateHash = await generatePHash(candidate.coverUrl)
+        if (candidateHash !== null) {
+          const dist = hammingDistance(sourcePHash, candidateHash)
+          Logger.debug(`  pHash dist=${dist} for ${candidate.slug}`)
+          if (dist >= 0 && dist < PHASH_HAMMING_THRESHOLD) {
+            Logger.success(
+              `✅ Cross-provider pHash match: ${targetProvider}/${candidate.slug} (dist=${dist})`
+            )
+            return { slug: candidate.slug, phash: candidateHash }
+          }
+        }
+      }
+
+      // ── Step B: Metadata fallback — scrape detail page ──────────────────
+      // pHash didn't match conclusively. Scrape the full detail page and
+      // run a THREE-factor check: title similarity + year + episode count.
+      // All three must pass to avoid false positives like "yuukawa" ≠ "SI-VIS".
+      const scraper = targetProvider === 'animasu' ? scrapeAnimasuDetail : scrapeSamehadakuDetail
+      const detail = await scraper(candidate.slug)
+
+      if (detail !== null && isCoverUrlValid(detail.coverUrl, targetProvider)) {
+        // Gate 1: Title must be similar to MAL title (> threshold)
+        // Without this, unrelated anime with same year/episodes will match.
+        const cleanedDetailTitle = AnimeNormalizer.cleanTitle(detail.title)
+        const malTitle = AnimeNormalizer.cleanTitle(jikanAnime.title_english ?? jikanAnime.title)
+        const malTitleRomaji = AnimeNormalizer.cleanTitle(jikanAnime.title)
+
+        const titleSim = Math.max(
+          AnimeNormalizer.calculateSimilarity(
+            AnimeNormalizer.normaliseSeason(cleanedDetailTitle),
+            AnimeNormalizer.normaliseSeason(malTitle)
+          ),
+          AnimeNormalizer.calculateSimilarity(
+            AnimeNormalizer.normaliseSeason(cleanedDetailTitle),
+            AnimeNormalizer.normaliseSeason(malTitleRomaji)
+          )
+        )
+
+        Logger.debug(
+          `  Title sim=${titleSim.toFixed(3)} for "${cleanedDetailTitle}" vs "${malTitle}"`
+        )
+
+        if (titleSim < TITLE_SIMILARITY_THRESHOLD) {
+          Logger.debug(`  Title mismatch for ${candidate.slug} — skipping`)
+          continue
+        }
+
+        // Gate 2: Year + episode count
+        // At least one metadata field must be known and pass validation.
+        // If BOTH year and totalEpisodes are null/unknown, we cannot confirm
+        // identity via metadata — skip to avoid false positives.
+        const effectiveEpisodes =
+          detail.totalEpisodes !== null && detail.totalEpisodes > 0 ? detail.totalEpisodes : null
+        const hasAnyMeta = detail.year !== null || effectiveEpisodes !== null
+        if (!hasAnyMeta) {
+          Logger.debug(`  No metadata available for ${candidate.slug} — cannot confirm, skipping`)
+          continue
+        }
+
+        const metaOk = validateMetadataMatch(
+          jikanAnime,
+          { year: detail.year, totalEpisodes: effectiveEpisodes },
+          EPISODE_COUNT_TOLERANCE
+        )
+        if (metaOk) {
+          Logger.success(`✅ Cross-provider metadata match: ${targetProvider}/${candidate.slug}`)
+          return { slug: candidate.slug, phash: null }
+        }
+        Logger.debug(`  Year/episode mismatch for ${candidate.slug} — trying next`)
+      }
+    }
+  }
+
+  // ── Last resort: direct slug derivation ──────────────────────────────────
+  // WordPress search may fail for short/acronym titles (e.g. "SI-VIS" → 0 results).
+  // Try hitting the detail page directly using canonical slugs derived from all
+  // MAL title variants. This covers cases like samehadaku.how/anime/si-vis/.
+  Logger.debug(`  Search exhausted — trying direct slug hits as last resort`)
+
+  const directSlugs: string[] = []
+  const directSeen = new Set<string>()
+
+  for (const t of [jikanAnime.title_english, jikanAnime.title, jikanAnime.title_japanese].filter(
+    (x): x is string => x !== null && x.length > 0
+  )) {
+    // Full slug
+    const full = AnimeNormalizer.createCanonicalSlug(t)
+    if (full !== '' && !directSeen.has(full)) {
+      directSeen.add(full)
+      directSlugs.push(full)
+    }
+
+    // Pre-colon prefix slug (e.g. "SI-VIS: The Sound of Heroes" → "si-vis")
+    const colonIdx = t.indexOf(':')
+    if (colonIdx > 0) {
+      const prefix = AnimeNormalizer.createCanonicalSlug(t.slice(0, colonIdx))
+      if (prefix !== '' && !directSeen.has(prefix)) {
+        directSeen.add(prefix)
+        directSlugs.push(prefix)
+      }
+    }
+  }
+
+  const directScraper = targetProvider === 'animasu' ? scrapeAnimasuDetail : scrapeSamehadakuDetail
+
+  for (const directSlug of directSlugs) {
+    Logger.debug(`  Direct hit attempt: ${targetProvider}/${directSlug}`)
+    const detail = await directScraper(directSlug)
+
+    if (detail === null || !isCoverUrlValid(detail.coverUrl, targetProvider)) continue
+
+    // Verify title similarity
+    const cleanedDetail = AnimeNormalizer.cleanTitle(detail.title)
+    const malEn = AnimeNormalizer.cleanTitle(jikanAnime.title_english ?? jikanAnime.title)
+    const malRo = AnimeNormalizer.cleanTitle(jikanAnime.title)
+
+    const sim = Math.max(
+      AnimeNormalizer.calculateSimilarity(
+        AnimeNormalizer.normaliseSeason(cleanedDetail),
+        AnimeNormalizer.normaliseSeason(malEn)
+      ),
+      AnimeNormalizer.calculateSimilarity(
+        AnimeNormalizer.normaliseSeason(cleanedDetail),
+        AnimeNormalizer.normaliseSeason(malRo)
+      )
+    )
+
+    Logger.debug(`  Direct slug title sim=${sim.toFixed(3)} for "${cleanedDetail}"`)
+
+    // Also accept if one title is a prefix of the other — handles cases where
+    // a provider uses a shortened title (e.g. "SI-VIS" vs "SI-VIS: The Sound of Heroes").
+    const normDetail = AnimeNormalizer.normaliseSeason(cleanedDetail).toLowerCase()
+    const normEn = AnimeNormalizer.normaliseSeason(malEn).toLowerCase()
+    const normRo = AnimeNormalizer.normaliseSeason(malRo).toLowerCase()
+    const isPrefixMatch =
+      normEn.startsWith(normDetail) ||
+      normRo.startsWith(normDetail) ||
+      normDetail.startsWith(normEn) ||
+      normDetail.startsWith(normRo)
+
+    if (sim < TITLE_SIMILARITY_THRESHOLD && !isPrefixMatch) {
+      Logger.debug(`  Direct slug title mismatch — skipping`)
+      continue
+    }
+
+    if (isPrefixMatch && sim < TITLE_SIMILARITY_THRESHOLD) {
+      Logger.debug(`  Direct slug accepted via prefix match`)
+    }
+
+    // pHash confirm if we have source hash
+    if (sourcePHash !== null) {
+      const candidateHash = await generatePHash(detail.coverUrl)
+      if (candidateHash !== null) {
+        const dist = hammingDistance(sourcePHash, candidateHash)
+        Logger.debug(`  Direct slug pHash dist=${dist} for ${directSlug}`)
+        if (dist >= 0 && dist < PHASH_HAMMING_THRESHOLD) {
+          Logger.success(
+            `✅ Direct slug pHash match: ${targetProvider}/${directSlug} (dist=${dist})`
+          )
+          return { slug: directSlug, phash: candidateHash }
+        }
+      }
+    }
+
+    // Metadata confirm
+    const effectiveEps =
+      detail.totalEpisodes !== null && detail.totalEpisodes > 0 ? detail.totalEpisodes : null
+    const hasAnyMeta = detail.year !== null || effectiveEps !== null
+    if (hasAnyMeta) {
+      const metaOk = validateMetadataMatch(
+        jikanAnime,
+        { year: detail.year, totalEpisodes: effectiveEps },
+        EPISODE_COUNT_TOLERANCE
+      )
+      if (metaOk) {
+        Logger.success(`✅ Direct slug metadata match: ${targetProvider}/${directSlug}`)
+        return { slug: directSlug, phash: null }
+      }
+    } else {
+      // Title confirmed, no metadata to contradict — accept on title alone
+      Logger.success(`✅ Direct slug title-only match: ${targetProvider}/${directSlug}`)
+      return { slug: directSlug, phash: null }
+    }
+  }
+
+  Logger.debug(`  No valid cross-provider slug found on ${targetProvider}`)
+  return null
+}
+
+// ── Core Discovery Logic ──────────────────────────────────────────────────────
+
+/**
+ * runDiscovery — Full multi-factor enrichment pipeline for a single anime.
+ *
+ * Pipeline:
+ *  1. Scrape the source provider detail page → title, cover, year, episodes
+ *  2. Generate pHash from poster (in-memory, no disk I/O)
+ *  3. Visual match: query Supabase for existing pHash within Hamming threshold
+ *  4. Metadata fallback: if no visual match, search Jikan by normalised title
+ *  5. Validate Jikan result with year + episode metadata
+ *  6. Cross-provider: discover opposite provider slug
+ *  7. Upsert complete "Triangle Mapping" into Supabase
+ *
+ * Returns the upserted AnimeMapping, or null if MAL ID could not be resolved.
+ */
+async function runDiscovery(
+  slug: string,
+  provider: 'samehadaku' | 'animasu'
+): Promise<AnimeMapping | null> {
+  Logger.info(`🚀 Starting enrichment for ${provider}/${slug}`)
+
+  // ── Step 1: Scrape detail page ────────────────────────────────────────────
+  const scraper = provider === 'samehadaku' ? scrapeSamehadakuDetail : scrapeAnimasuDetail
+  const detail = await scraper(slug)
+
+  if (detail === null) {
+    Logger.warning(`⚠️  Could not scrape detail page for ${provider}/${slug}`)
+    return null
+  }
+
+  Logger.info(
+    `📄 Scraped: "${detail.title}" | year=${detail.year ?? '?'} | eps=${detail.totalEpisodes ?? '?'}`
+  )
+
+  // ── Step 2: Generate pHash in-memory ─────────────────────────────────────
+  const pHash = await generatePHash(detail.coverUrl)
+
+  // ── Step 3: Visual match via Supabase ────────────────────────────────────
+  let matchResult: MatchResult = {
+    method: 'none',
+    malId: null,
+    titleMain: null,
+    confidence: 0,
+    jikanAnime: null,
+  }
+
+  if (pHash !== null) {
+    Logger.debug(`🔍 Querying Supabase for pHash match (threshold < ${PHASH_HAMMING_THRESHOLD})`)
+    const existing = await findMappingByPHash(pHash, PHASH_HAMMING_THRESHOLD)
+
+    if (existing !== null) {
+      Logger.success(`✅ Visual match found: mal_id=${existing.mal_id} "${existing.title_main}"`)
+      matchResult = {
+        method: 'phash',
+        malId: existing.mal_id,
+        titleMain: existing.title_main,
+        confidence: 1.0,
+        jikanAnime: await getAnimeById(existing.mal_id),
+      }
+    }
+  }
+
+  // ── Step 4 & 5: Jikan metadata fallback ──────────────────────────────────
+  if (matchResult.method === 'none') {
+    // Always clean the title before sending to Jikan — strip "Sub Indo",
+    // "Nonton Anime", batch suffixes, etc. that pollute fuzzy scoring.
+    const cleanedTitle = AnimeNormalizer.cleanTitle(detail.title)
+    Logger.info(`🔍 No visual match — searching Jikan for: "${cleanedTitle}"`)
+    const jikanResult = await searchByTitle(cleanedTitle)
+
+    if (jikanResult !== null) {
+      const isExact =
+        AnimeNormalizer.calculateSimilarity(
+          AnimeNormalizer.normaliseSeason(cleanedTitle),
+          AnimeNormalizer.normaliseSeason(jikanResult.title)
+        ) >= TITLE_SIMILARITY_THRESHOLD
+
+      const metaOk = validateMetadataMatch(
+        jikanResult,
+        { year: detail.year, totalEpisodes: detail.totalEpisodes },
+        EPISODE_COUNT_TOLERANCE
+      )
+
+      if (isExact || metaOk) {
+        const confidence = isExact && metaOk ? 1.0 : isExact ? 0.9 : 0.75
+        matchResult = {
+          method: isExact ? 'jikan_exact' : 'jikan_fuzzy',
+          malId: jikanResult.mal_id,
+          titleMain: jikanResult.title,
+          confidence,
+          jikanAnime: jikanResult,
+        }
+        Logger.success(
+          `✅ Jikan match (${matchResult.method}): "${jikanResult.title}" ` +
+            `mal_id=${jikanResult.mal_id} confidence=${confidence}`
+        )
+      } else {
+        Logger.warning(
+          `⚠️  Jikan candidate "${jikanResult.title}" failed metadata validation — skipping`
+        )
+      }
+    }
+  }
+
+  if (matchResult.malId === null || matchResult.jikanAnime === null) {
+    Logger.warning(`⚠️  Could not resolve MAL ID for ${provider}/${slug}`)
+    return null
+  }
+
+  // ── Step 6: Cross-provider slug discovery ─────────────────────────────────
+  const opposite = await discoverOppositeSlug(matchResult.jikanAnime, provider, pHash)
+
+  // ── Step 7: Build triangle mapping and upsert ─────────────────────────────
+  const slugSamehadaku = provider === 'samehadaku' ? slug : (opposite?.slug ?? null)
+  const slugAnimasu = provider === 'animasu' ? slug : (opposite?.slug ?? null)
+
+  // Use source pHash or the opposite provider's hash (whichever we have)
+  const finalPHash = pHash ?? opposite?.phash ?? null
+
+  const mapping = await upsertMapping({
+    malId: matchResult.malId,
+    titleMain: matchResult.titleMain ?? matchResult.jikanAnime.title,
+    slugSamehadaku,
+    slugAnimasu,
+    phashV1: finalPHash,
+    releaseYear: matchResult.jikanAnime.year ?? detail.year,
+    totalEpisodes: matchResult.jikanAnime.episodes ?? detail.totalEpisodes,
+  })
+
+  Logger.success(
+    `💾 Mapping saved: mal_id=${mapping.mal_id} | ` +
+      `samehadaku=${mapping.slug_samehadaku ?? '-'} | animasu=${mapping.slug_animasu ?? '-'}`
+  )
+
+  return mapping
+}
+
+// ── Public entrypoint (with Request Lock) ─────────────────────────────────────
+
+/**
+ * resolveMapping — Public entrypoint used by the controller.
+ *
+ * Implements the Request Lock pattern: if a concurrent request for the same
+ * slug is already running the Enrichment Phase, subsequent callers await the
+ * same Promise instead of spawning duplicate discovery jobs.
+ */
+export async function resolveMapping(
+  slug: string,
+  provider: 'samehadaku' | 'animasu'
+): Promise<AnimeMapping | null> {
+  const lockKey = `${provider}:${slug}`
+
+  // Reuse an in-flight enrichment if one exists
+  const existing = enrichmentLocks.get(lockKey)
+  if (existing !== undefined) {
+    Logger.debug(`⏳ Request lock active for ${lockKey} — awaiting existing job`)
+    return await existing
+  }
+
+  // Kick off enrichment and register the lock
+  const job = runDiscovery(slug, provider).finally(() => {
+    enrichmentLocks.delete(lockKey)
+  })
+
+  enrichmentLocks.set(lockKey, job)
+  return await job
+}
