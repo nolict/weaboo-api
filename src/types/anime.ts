@@ -52,6 +52,67 @@ export interface JikanSearchResponse {
   pagination: { has_next_page: boolean; items: { count: number; total: number } }
 }
 
+// ── Jikan full metadata (from /anime/:id/full endpoint) ──────────────────────
+
+export interface JikanGenre {
+  mal_id: number
+  name: string
+}
+
+export interface JikanStudio {
+  mal_id: number
+  name: string
+}
+
+export interface JikanAnimeFull {
+  mal_id: number
+  title: string
+  title_english: string | null
+  title_japanese: string | null
+  synopsis: string | null
+  type: string | null // TV, Movie, OVA, ONA, Special, Music
+  episodes: number | null
+  status: string | null // Airing, Finished Airing, Not yet aired
+  duration: string | null // e.g. "24 min per ep"
+  score: number | null
+  rank: number | null
+  year: number | null
+  season: string | null // spring, summer, fall, winter
+  genres: JikanGenre[]
+  studios: JikanStudio[]
+  images: {
+    jpg: { image_url: string; large_image_url: string }
+  }
+}
+
+export interface JikanFullResponse {
+  data: JikanAnimeFull
+}
+
+// ── Episode types ─────────────────────────────────────────────────────────────
+
+/**
+ * Represents a single episode entry from a provider.
+ * For multi-episode cards (e.g. "Episode 115-120"), episodeStart !== episodeEnd.
+ */
+export interface EpisodeEntry {
+  label: string // Raw label from provider, e.g. "Episode 7" or "Episode 115-120"
+  episodeStart: number // First (or only) episode number
+  episodeEnd: number // Last episode number (same as episodeStart for single episodes)
+  url: string // Full URL to watch page
+}
+
+export interface ProviderEpisodeList {
+  provider: string
+  episodes: EpisodeEntry[]
+  cachedAt: number // timestamp for TTL tracking
+}
+
+export interface EpisodeList {
+  animasu: EpisodeEntry[] | null
+  samehadaku: EpisodeEntry[] | null
+}
+
 // ── Supabase / Database mapping record ───────────────────────────────────────
 
 export interface AnimeMapping {
@@ -68,10 +129,16 @@ export interface AnimeMapping {
 
 // ── API response shapes ───────────────────────────────────────────────────────
 
+export interface AnimeDetailResponse {
+  mapping: AnimeMapping
+  mal: JikanAnimeFull | null
+  episodes: EpisodeList
+}
+
 export interface MappingApiResponse {
   success: boolean
   cached: boolean // true = returned from Supabase, false = freshly enriched
-  data: AnimeMapping | null
+  data: AnimeDetailResponse | null
   error?: string
 }
 

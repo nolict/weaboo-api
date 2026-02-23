@@ -1,6 +1,8 @@
-import { findMappingBySlug } from '../lib/supabase'
+import { findMalMetadata, findMappingBySlug, upsertMalMetadata } from '../lib/supabase'
+import { getEpisodeList } from '../services/episodes'
+import { getAnimeFullById } from '../services/jikan'
 import { resolveMapping } from '../services/mapping'
-import type { MappingApiResponse } from '../types/anime'
+import type { AnimeDetailResponse, MappingApiResponse } from '../types/anime'
 import { Logger } from '../utils/logger'
 
 // ── Allowed provider values ───────────────────────────────────────────────────
@@ -19,17 +21,18 @@ export class AnimeController {
    *
    * Full flow:
    *  1. Validate `provider` query param.
-   *  2. Look up Supabase for the incoming slug (cache hit → return immediately).
-   *  3. On cache miss → enter Enrichment Phase (with Request Lock to prevent
-   *     duplicate concurrent scrapes for the same slug).
-   *  4. Return the full "Triangle Mapping" or a structured error.
+   *  2. Look up Supabase for the incoming slug (mapping cache hit → skip enrichment).
+   *  3. On cache miss → enter Enrichment Phase (with Request Lock).
+   *  4. Fetch MAL full metadata (permanent in-memory cache keyed by mal_id).
+   *  5. Fetch episode lists from both providers concurrently (20-min TTL cache).
+   *  6. Return combined response: { mapping, mal, episodes }.
    *
-   * Episode tolerance is handled transparently inside MappingService:
-   * if one provider is 1–2 eps ahead, the system still confirms the match
-   * and notes the discrepancy via `total_episodes` from Jikan (authoritative).
+   * The `cached` flag in the response reflects the mapping cache status only
+   * (Supabase hit vs freshly enriched). MAL metadata and episode caching are
+   * transparent implementation details.
    */
   async getAnime(slug: string, rawProvider: string | null): Promise<Response> {
-    // ── Validate provider param ─────────────────────────────────────────────
+    // ── Validate provider param ───────────────────────────────────────────────
     if (rawProvider === null || rawProvider === '') {
       return this.errorResponse(400, 'Missing query parameter: provider=[samehadaku|animasu]')
     }
@@ -43,7 +46,7 @@ export class AnimeController {
 
     const provider: ProviderName = rawProvider
 
-    // ── Validate slug ───────────────────────────────────────────────────────
+    // ── Validate slug ─────────────────────────────────────────────────────────
     const cleanSlug = slug.trim().toLowerCase()
     if (cleanSlug === '') {
       return this.errorResponse(400, 'Slug cannot be empty')
@@ -52,28 +55,66 @@ export class AnimeController {
     Logger.info(`📥 GET /anime/${cleanSlug}?provider=${provider}`)
 
     try {
-      // ── Step 1: Check Supabase cache ──────────────────────────────────────
-      const cached = await findMappingBySlug(cleanSlug, provider)
+      // ── Step 1: Resolve mapping (Supabase cache or fresh enrichment) ─────────
+      let mappingCached = false
+      let mapping = await findMappingBySlug(cleanSlug, provider)
 
-      if (cached !== null) {
-        Logger.success(`⚡ Cache hit: ${provider}/${cleanSlug} → mal_id=${cached.mal_id}`)
-        return this.successResponse(cached, true)
+      if (mapping !== null) {
+        Logger.success(`⚡ Mapping cache hit: ${provider}/${cleanSlug} → mal_id=${mapping.mal_id}`)
+        mappingCached = true
+      } else {
+        Logger.info(`🔄 Cache miss for ${provider}/${cleanSlug} — starting enrichment`)
+        mapping = await resolveMapping(cleanSlug, provider)
+
+        if (mapping === null) {
+          return this.errorResponse(
+            404,
+            `Could not resolve mapping for ${provider}/${cleanSlug}. ` +
+              `The anime may not exist on this provider or MAL could not be identified.`
+          )
+        }
       }
 
-      Logger.info(`🔄 Cache miss for ${provider}/${cleanSlug} — starting enrichment`)
+      // ── Step 2: MAL full metadata (Supabase cache → Jikan fallback) ────────────
+      // Supabase is the permanent store — no in-memory layer needed.
+      // On cache miss, fetch from Jikan and persist to Supabase (fire-and-forget).
+      Logger.debug(`🗄️  Checking Supabase MAL metadata for mal_id=${mapping.mal_id}`)
+      let malMeta = await findMalMetadata(mapping.mal_id)
 
-      // ── Step 2: Enrichment Phase (with Request Lock) ──────────────────────
-      const mapping = await resolveMapping(cleanSlug, provider)
-
-      if (mapping === null) {
-        return this.errorResponse(
-          404,
-          `Could not resolve mapping for ${provider}/${cleanSlug}. ` +
-            `The anime may not exist on this provider or MAL could not be identified.`
+      if (malMeta !== null) {
+        Logger.debug(`⚡ MAL metadata cache hit (Supabase) for mal_id=${mapping.mal_id}`)
+      } else {
+        Logger.debug(
+          `🌐 Cache miss — fetching MAL metadata from Jikan for mal_id=${mapping.mal_id}`
         )
+        malMeta = await getAnimeFullById(mapping.mal_id)
+
+        if (malMeta !== null) {
+          upsertMalMetadata(malMeta).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err)
+            Logger.warning(`⚠️  Failed to persist MAL metadata to Supabase: ${msg}`)
+          })
+          Logger.debug(`📌 MAL metadata saved to Supabase for mal_id=${mapping.mal_id}`)
+        } else {
+          Logger.warning(`⚠️  MAL full metadata unavailable for mal_id=${mapping.mal_id}`)
+        }
       }
 
-      return this.successResponse(mapping, false)
+      // ── Step 3: Episode lists (20-minute TTL cache, both providers concurrent) ─
+      Logger.debug(
+        `📺 Fetching episodes — animasu: ${mapping.slug_animasu ?? 'n/a'}, ` +
+          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}`
+      )
+      const episodes = await getEpisodeList(mapping.slug_animasu, mapping.slug_samehadaku)
+
+      // ── Step 4: Compose response ──────────────────────────────────────────────
+      const detail: AnimeDetailResponse = {
+        mapping,
+        mal: malMeta,
+        episodes,
+      }
+
+      return this.successResponse(detail, mappingCached)
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error'
       Logger.error(`❌ AnimeController error for ${provider}/${cleanSlug}:`, error)
@@ -81,9 +122,9 @@ export class AnimeController {
     }
   }
 
-  // ── Private response builders ───────────────────────────────────────────────
+  // ── Private response builders ─────────────────────────────────────────────────
 
-  private successResponse(data: MappingApiResponse['data'], cached: boolean): Response {
+  private successResponse(data: AnimeDetailResponse, cached: boolean): Response {
     const body: MappingApiResponse = { success: true, cached, data }
     return new Response(JSON.stringify(body), {
       status: 200,

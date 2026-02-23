@@ -635,7 +635,7 @@ async function runDiscovery(
     // "Nonton Anime", batch suffixes, etc. that pollute fuzzy scoring.
     const cleanedTitle = AnimeNormalizer.cleanTitle(detail.title)
     Logger.info(`🔍 No visual match — searching Jikan for: "${cleanedTitle}"`)
-    const jikanResult = await searchByTitle(cleanedTitle)
+    const jikanResult = await searchByTitle(cleanedTitle, detail.year)
 
     if (jikanResult !== null) {
       const isExact =

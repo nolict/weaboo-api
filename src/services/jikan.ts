@@ -1,7 +1,12 @@
 import axios from 'axios'
 
 import { JIKAN_BASE_URL, TITLE_SIMILARITY_THRESHOLD } from '../config/constants'
-import type { JikanAnime, JikanSearchResponse } from '../types/anime'
+import type {
+  JikanAnime,
+  JikanAnimeFull,
+  JikanFullResponse,
+  JikanSearchResponse,
+} from '../types/anime'
 import { Logger } from '../utils/logger'
 import { AnimeNormalizer } from '../utils/normalizer'
 
@@ -132,8 +137,16 @@ function scoreCandidate(normalisedQuery: string, candidate: JikanAnime): number 
  *   "Jigokuraku part 2" → 0 Jikan hits  (Jikan doesn't index "part 2" form)
  *   "Jigokuraku Season 2" → ✅ correct hit
  *   "Jigokuraku" → ✅ correct hit (base series, season validated via metadata)
+ *
+ * @param scrapedYear - Optional year from provider detail page. Used to
+ *   tiebreak when multiple candidates share the same top score (e.g. two
+ *   entries both named "Monster" — one Music 2025, one TV 2004). The
+ *   candidate whose year matches scrapedYear wins the tie.
  */
-export async function searchByTitle(rawTitle: string): Promise<JikanAnime | null> {
+export async function searchByTitle(
+  rawTitle: string,
+  scrapedYear: number | null = null
+): Promise<JikanAnime | null> {
   try {
     const queries = buildJikanQueries(rawTitle)
     // normaliseSeason form of the raw title — used for scoring regardless of which query found hits
@@ -141,6 +154,8 @@ export async function searchByTitle(rawTitle: string): Promise<JikanAnime | null
 
     let bestMatch: JikanAnime | null = null
     let bestScore = 0
+    // Track whether bestMatch already has a year match — used for tiebreaking
+    let bestHasYearMatch = false
 
     for (const query of queries) {
       const candidates = await searchRaw(query)
@@ -158,14 +173,32 @@ export async function searchByTitle(rawTitle: string): Promise<JikanAnime | null
           `  [q="${query}"] Candidate: "${candidate.title}" (mal_id: ${candidate.mal_id}) → score: ${score.toFixed(3)}`
         )
 
-        if (score > bestScore) {
+        // Year match tiebreaker: when scrapedYear is known, prefer the candidate
+        // whose year matches over one that doesn't — even at equal score.
+        // e.g. "Monster" query returns both "Monster (Music, 2025)" and "Monster (TV, 2004)".
+        // With scrapedYear=2004, the TV 2004 entry wins the tie.
+        const candidateYearMatch =
+          scrapedYear !== null &&
+          candidate.year !== null &&
+          Math.abs(candidate.year - scrapedYear) <= 1
+
+        const isBetter =
+          score > bestScore ||
+          // Tiebreak: same score but this candidate has a year match while current best doesn't
+          (score === bestScore && candidateYearMatch && !bestHasYearMatch)
+
+        if (isBetter) {
           bestScore = score
           bestMatch = candidate
+          bestHasYearMatch = candidateYearMatch
         }
       }
 
       // Early exit — no point trying more queries if we already have a strong match
-      if (bestScore >= TITLE_SIMILARITY_THRESHOLD) break
+      // AND the year tiebreak is already resolved (year match found or scrapedYear unknown)
+      if (bestScore >= TITLE_SIMILARITY_THRESHOLD && (scrapedYear === null || bestHasYearMatch)) {
+        break
+      }
     }
 
     if (bestScore < TITLE_SIMILARITY_THRESHOLD) {
@@ -202,6 +235,29 @@ export async function getAnimeById(malId: number): Promise<JikanAnime | null> {
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
     Logger.warning(`⚠️  Jikan getById failed for mal_id ${malId}: ${msg}`)
+    return null
+  }
+}
+
+/**
+ * getAnimeFullById — Fetch the full MAL entry (with synopsis, studios, genres,
+ * trailer, rating, score, etc.) via the /anime/:id/full endpoint.
+ *
+ * This is the "rich" variant of getAnimeById used for the detail response.
+ * Permanent cache is managed in-memory by the caller (AnimeController).
+ */
+export async function getAnimeFullById(malId: number): Promise<JikanAnimeFull | null> {
+  try {
+    await jikanThrottle()
+
+    const url = `${JIKAN_BASE_URL}/anime/${malId}/full`
+    Logger.debug(`🔍 Jikan fetch full by ID: ${malId}`)
+
+    const response = await axios.get<JikanFullResponse>(url, { timeout: 10_000 })
+    return response.data.data
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    Logger.warning(`⚠️  Jikan getFullById failed for mal_id ${malId}: ${msg}`)
     return null
   }
 }

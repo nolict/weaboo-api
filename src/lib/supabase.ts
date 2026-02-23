@@ -1,7 +1,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 
 import { hammingDistance } from '../services/image'
-import type { AnimeMapping } from '../types/anime'
+import type { AnimeMapping, JikanAnimeFull } from '../types/anime'
 
 // ── Singleton Supabase client ────────────────────────────────────────────────
 // Credentials are injected via environment variables — never hard-coded.
@@ -19,8 +19,9 @@ export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey, {
   auth: { persistSession: false },
 })
 
-// ── Table name constant — single source of truth ────────────────────────────
+// ── Table name constants — single source of truth ────────────────────────────
 const TABLE = 'anime_mappings'
+const MAL_TABLE = 'mal_metadata'
 
 // ── Query helpers ────────────────────────────────────────────────────────────
 
@@ -91,6 +92,75 @@ export async function findMappingByPHash(
   }
 
   return result
+}
+
+/**
+ * findMalMetadata — Fetch cached MAL full metadata from Supabase by mal_id.
+ * Returns null if no record exists yet (cache miss → caller fetches from Jikan).
+ */
+export async function findMalMetadata(malId: number): Promise<JikanAnimeFull | null> {
+  const { data, error } = await supabase
+    .from(MAL_TABLE)
+    .select('*')
+    .eq('mal_id', malId)
+    .maybeSingle()
+
+  if (error !== null) throw new Error(`Supabase mal_metadata lookup failed: ${error.message}`)
+  if (data === null) return null
+
+  // Re-map DB row → JikanAnimeFull shape
+  const row = data as Record<string, unknown>
+  return {
+    mal_id: row.mal_id as number,
+    title: row.title as string,
+    title_english: (row.title_english as string | null) ?? null,
+    title_japanese: (row.title_japanese as string | null) ?? null,
+    synopsis: (row.synopsis as string | null) ?? null,
+    type: (row.type as string | null) ?? null,
+    episodes: (row.episodes as number | null) ?? null,
+    status: (row.status as string | null) ?? null,
+    duration: (row.duration as string | null) ?? null,
+    score: (row.score as number | null) ?? null,
+    rank: (row.rank as number | null) ?? null,
+    year: (row.release_year as number | null) ?? null,
+    season: (row.season as string | null) ?? null,
+    genres: (row.genres as Array<{ mal_id: number; name: string }>) ?? [],
+    studios: (row.studios as Array<{ mal_id: number; name: string }>) ?? [],
+    images: {
+      jpg: {
+        image_url: (row.image_url as string) ?? '',
+        large_image_url: (row.large_image_url as string) ?? '',
+      },
+    },
+  }
+}
+
+/**
+ * upsertMalMetadata — Persist full MAL metadata to Supabase via the
+ * upsert_mal_metadata RPC. Always overwrites — MAL data is authoritative.
+ */
+export async function upsertMalMetadata(mal: JikanAnimeFull): Promise<void> {
+  const { error } = await supabase.rpc('upsert_mal_metadata', {
+    p_mal_id: mal.mal_id,
+    p_title: mal.title,
+    p_title_english: mal.title_english ?? null,
+    p_title_japanese: mal.title_japanese ?? null,
+    p_synopsis: mal.synopsis ?? null,
+    p_type: mal.type ?? null,
+    p_episodes: mal.episodes ?? null,
+    p_status: mal.status ?? null,
+    p_duration: mal.duration ?? null,
+    p_score: mal.score ?? null,
+    p_rank: mal.rank ?? null,
+    p_release_year: mal.year ?? null,
+    p_season: mal.season ?? null,
+    p_genres: mal.genres,
+    p_studios: mal.studios,
+    p_image_url: mal.images.jpg.image_url ?? null,
+    p_large_image_url: mal.images.jpg.large_image_url ?? null,
+  })
+
+  if (error !== null) throw new Error(`Supabase upsert_mal_metadata failed: ${error.message}`)
 }
 
 /**

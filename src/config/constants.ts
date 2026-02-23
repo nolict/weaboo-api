@@ -32,3 +32,8 @@ export const EPISODE_COUNT_TOLERANCE = 2
 // blockhash-core produces a 256-bit hash → 64 hex characters
 export const PHASH_BITS = 256
 export const PHASH_HEX_LENGTH = 64
+
+// ── Cache TTLs ───────────────────────────────────────────────────────────────
+// MAL metadata cache: permanent (in-memory for process lifetime, Supabase persists forever)
+// Episode list cache: 20 minutes (TTL in milliseconds)
+export const EPISODE_CACHE_TTL_MS = 20 * 60 * 1000

@@ -108,6 +108,106 @@ AS $$
 $$;
 
 -- ============================================================
+-- TABLE: mal_metadata
+--
+-- Permanent cache for full MAL (MyAnimeList) metadata per anime.
+-- Keyed by mal_id (FK to anime_mappings.mal_id).
+-- Populated on first request, never expires (reference data).
+-- Studios and genres stored as JSONB arrays for flexibility.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS mal_metadata (
+  mal_id          INTEGER      PRIMARY KEY REFERENCES anime_mappings(mal_id) ON DELETE CASCADE,
+  title           TEXT         NOT NULL,
+  title_english   TEXT,
+  title_japanese  TEXT,
+  synopsis        TEXT,
+  type            VARCHAR(20),           -- TV, Movie, OVA, ONA, Special, Music
+  episodes        INTEGER,
+  status          VARCHAR(50),           -- Airing, Finished Airing, Not yet aired
+  duration        VARCHAR(50),           -- e.g. "24 min per ep"
+  score           NUMERIC(4,2),
+  rank            INTEGER,
+  release_year    INTEGER,
+  season          VARCHAR(20),           -- spring, summer, fall, winter
+  genres          JSONB        NOT NULL DEFAULT '[]'::jsonb,
+  studios         JSONB        NOT NULL DEFAULT '[]'::jsonb,
+  image_url       TEXT,
+  large_image_url TEXT,
+  cached_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mal_metadata_mal_id ON mal_metadata (mal_id);
+
+-- ============================================================
+-- HELPER: upsert_mal_metadata
+--
+-- Inserts or fully replaces MAL metadata for a given mal_id.
+-- Always overwrites on conflict (MAL data is authoritative).
+-- ============================================================
+CREATE OR REPLACE FUNCTION upsert_mal_metadata(
+  p_mal_id          INTEGER,
+  p_title           TEXT,
+  p_title_english   TEXT         DEFAULT NULL,
+  p_title_japanese  TEXT         DEFAULT NULL,
+  p_synopsis        TEXT         DEFAULT NULL,
+  p_type            VARCHAR(20)  DEFAULT NULL,
+  p_episodes        INTEGER      DEFAULT NULL,
+  p_status          VARCHAR(50)  DEFAULT NULL,
+  p_duration        VARCHAR(50)  DEFAULT NULL,
+  p_score           NUMERIC(4,2) DEFAULT NULL,
+  p_rank            INTEGER      DEFAULT NULL,
+  p_release_year    INTEGER      DEFAULT NULL,
+  p_season          VARCHAR(20)  DEFAULT NULL,
+  p_genres          JSONB        DEFAULT '[]'::jsonb,
+  p_studios         JSONB        DEFAULT '[]'::jsonb,
+  p_image_url       TEXT         DEFAULT NULL,
+  p_large_image_url TEXT         DEFAULT NULL
+)
+RETURNS mal_metadata
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  result mal_metadata;
+BEGIN
+  INSERT INTO mal_metadata (
+    mal_id, title, title_english, title_japanese,
+    synopsis, type, episodes, status, duration,
+    score, rank, release_year, season,
+    genres, studios, image_url, large_image_url,
+    cached_at
+  )
+  VALUES (
+    p_mal_id, p_title, p_title_english, p_title_japanese,
+    p_synopsis, p_type, p_episodes, p_status, p_duration,
+    p_score, p_rank, p_release_year, p_season,
+    p_genres, p_studios, p_image_url, p_large_image_url,
+    NOW()
+  )
+  ON CONFLICT (mal_id) DO UPDATE SET
+    title           = EXCLUDED.title,
+    title_english   = EXCLUDED.title_english,
+    title_japanese  = EXCLUDED.title_japanese,
+    synopsis        = EXCLUDED.synopsis,
+    type            = EXCLUDED.type,
+    episodes        = EXCLUDED.episodes,
+    status          = EXCLUDED.status,
+    duration        = EXCLUDED.duration,
+    score           = EXCLUDED.score,
+    rank            = EXCLUDED.rank,
+    release_year    = EXCLUDED.release_year,
+    season          = EXCLUDED.season,
+    genres          = EXCLUDED.genres,
+    studios         = EXCLUDED.studios,
+    image_url       = EXCLUDED.image_url,
+    large_image_url = EXCLUDED.large_image_url,
+    cached_at       = NOW()
+  RETURNING * INTO result;
+
+  RETURN result;
+END;
+$$;
+
+-- ============================================================
 -- HELPER: upsert_anime_mapping
 --
 -- Inserts a new mapping or updates an existing one by mal_id.
