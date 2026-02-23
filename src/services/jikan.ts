@@ -42,49 +42,130 @@ async function searchRaw(query: string, limit: number = 5): Promise<JikanAnime[]
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * searchByTitle — Queries Jikan for a title, then ranks candidates by
- * combined fuzzy-similarity score. Returns the best match above the
+ * buildJikanQueries — Produces an ordered list of search queries to try
+ * against Jikan for a given raw title. More specific queries come first.
+ *
+ * Strategy (in order):
+ *  1. Raw cleaned title as-is      → "Jigokuraku Season 2"   (most natural for Jikan)
+ *  2. Pre-season/cour base title   → "Jigokuraku"             (base series name only)
+ *  3. normaliseSeason form         → "Jigokuraku part 2"      (canonical, last resort)
+ *
+ * Duplicates are removed so we don't hammer Jikan with the same query twice.
+ */
+function buildJikanQueries(rawTitle: string): string[] {
+  const queries: string[] = []
+  const seen = new Set<string>()
+
+  const add = (q: string): void => {
+    const trimmed = q.trim()
+    if (trimmed.length > 0 && !seen.has(trimmed)) {
+      seen.add(trimmed)
+      queries.push(trimmed)
+    }
+  }
+
+  // 1. Raw title (cleaned of "Sub Indo" etc but season intact)
+  add(rawTitle)
+
+  // 2. Base title — strip everything from "Season/Cour/Part/S\d" onward
+  //    e.g. "Jigokuraku Season 2 Sub Indo" → "Jigokuraku"
+  const baseTitle = rawTitle
+    .replace(/\s*(season|cour|part|s)\s*\d+.*/gi, '')
+    .replace(/\s*\d+(st|nd|rd|th)\s*season.*/gi, '')
+    .trim()
+  add(baseTitle)
+
+  // 3. normaliseSeason form — canonical "part N" wording
+  add(AnimeNormalizer.normaliseSeason(rawTitle))
+
+  return queries
+}
+
+/**
+ * scoreCandidate — Computes the best similarity score between a query and
+ * all Jikan title variants (romaji, english, japanese). Both sides are
+ * normalised with normaliseSeason before comparison so season suffixes
+ * in different formats don't penalise the score.
+ */
+function scoreCandidate(normalisedQuery: string, candidate: JikanAnime): number {
+  const variants = [candidate.title, candidate.title_english, candidate.title_japanese].filter(
+    (t): t is string => t !== null && t.length > 0
+  )
+
+  // Normalise query for slug-style prefix comparison
+  const slugQuery = normalisedQuery
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+
+  let maxSim = 0
+  for (const variant of variants) {
+    const normVariant = AnimeNormalizer.normaliseSeason(variant)
+    const sim = AnimeNormalizer.calculateSimilarity(normalisedQuery, normVariant)
+
+    // Prefix match: query is a prefix of variant or vice-versa
+    // e.g. "si-vis" is a prefix of "si-vis-the-sound-of-heroes" → boost to 0.92
+    // Guard: query must be ≥5 chars to avoid short generic words ("one", "two")
+    // falsely matching long titles ("one piece", etc.)
+    const slugVariant = normVariant
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+    const isPrefixMatch =
+      slugQuery.length >= 5 &&
+      (slugVariant.startsWith(slugQuery + '-') ||
+        slugQuery.startsWith(slugVariant + '-') ||
+        slugVariant === slugQuery)
+
+    const finalSim = isPrefixMatch ? Math.max(sim, 0.92) : sim
+    if (finalSim > maxSim) maxSim = finalSim
+  }
+  return maxSim
+}
+
+/**
+ * searchByTitle — Queries Jikan with multiple query strategies, then ranks
+ * candidates by fuzzy-similarity score. Returns the best match above the
  * TITLE_SIMILARITY_THRESHOLD, or null if nothing qualifies.
  *
- * Smart normalisation is applied before comparison so that e.g.
- *   "Sakamoto Days Cour 2"  matches  "Sakamoto Days Part 2"
+ * Multi-query strategy prevents failures like:
+ *   "Jigokuraku part 2" → 0 Jikan hits  (Jikan doesn't index "part 2" form)
+ *   "Jigokuraku Season 2" → ✅ correct hit
+ *   "Jigokuraku" → ✅ correct hit (base series, season validated via metadata)
  */
 export async function searchByTitle(rawTitle: string): Promise<JikanAnime | null> {
   try {
-    // Normalise query title before sending to Jikan
-    const normalisedQuery = AnimeNormalizer.normaliseSeason(rawTitle)
-    const candidates = await searchRaw(normalisedQuery)
-
-    if (candidates.length === 0) {
-      Logger.debug(`Jikan returned 0 results for: "${normalisedQuery}"`)
-      return null
-    }
+    const queries = buildJikanQueries(rawTitle)
+    // normaliseSeason form of the raw title — used for scoring regardless of which query found hits
+    const normalisedRaw = AnimeNormalizer.normaliseSeason(rawTitle)
 
     let bestMatch: JikanAnime | null = null
     let bestScore = 0
 
-    for (const candidate of candidates) {
-      // Collect all title variants Jikan provides
-      const variants = [candidate.title, candidate.title_english, candidate.title_japanese].filter(
-        (t): t is string => t !== null && t.length > 0
-      )
+    for (const query of queries) {
+      const candidates = await searchRaw(query)
 
-      // Score = max similarity across all title variants
-      let maxSimilarity = 0
-      for (const variant of variants) {
-        const normVariant = AnimeNormalizer.normaliseSeason(variant)
-        const sim = AnimeNormalizer.calculateSimilarity(normalisedQuery, normVariant)
-        if (sim > maxSimilarity) maxSimilarity = sim
+      if (candidates.length === 0) {
+        Logger.debug(`Jikan returned 0 results for: "${query}"`)
+        continue
       }
 
-      Logger.debug(
-        `  Candidate: "${candidate.title}" (mal_id: ${candidate.mal_id}) → score: ${maxSimilarity.toFixed(3)}`
-      )
+      for (const candidate of candidates) {
+        // Score using the normaliseSeason form of raw title so "Season 2" ↔ "part 2" etc. compare fairly
+        const score = scoreCandidate(normalisedRaw, candidate)
 
-      if (maxSimilarity > bestScore) {
-        bestScore = maxSimilarity
-        bestMatch = candidate
+        Logger.debug(
+          `  [q="${query}"] Candidate: "${candidate.title}" (mal_id: ${candidate.mal_id}) → score: ${score.toFixed(3)}`
+        )
+
+        if (score > bestScore) {
+          bestScore = score
+          bestMatch = candidate
+        }
       }
+
+      // Early exit — no point trying more queries if we already have a strong match
+      if (bestScore >= TITLE_SIMILARITY_THRESHOLD) break
     }
 
     if (bestScore < TITLE_SIMILARITY_THRESHOLD) {

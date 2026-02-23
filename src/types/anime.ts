@@ -15,6 +15,7 @@ export interface ProviderResponse {
 
 export interface NormalizedAnime extends AnimeItem {
   sources: string[]
+  providerSlugs: Record<string, string> // provider → original slug from that provider
 }
 
 // ── Provider detail-page scrape result ───────────────────────────────────────

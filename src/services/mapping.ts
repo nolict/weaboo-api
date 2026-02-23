@@ -173,19 +173,24 @@ async function searchProviderForSlug(
 
     const results: Array<{ slug: string; coverUrl: string; cardTitle: string }> = []
 
-    // Both providers use WordPress .bs card structure in search results.
-    // Extract title from a[title] attr or .tt div — whichever is available.
-    $('.bs').each((_, el) => {
+    // Animasu uses .bs card structure; Samehadaku uses .animpost on search pages.
+    // We handle both selectors and extract title/slug/cover from each.
+    const cardSelector = targetProvider === 'animasu' ? '.bs' : '.animpost'
+
+    $(cardSelector).each((_, el) => {
       const $el = $(el)
       const $anchor = $el.find('a[title]').first()
       const href = $anchor.attr('href') ?? $el.find('a').first().attr('href') ?? ''
       const img =
         $el.find('img').first().attr('src') ?? $el.find('img').first().attr('data-src') ?? ''
 
-      // Card title: prefer .tt (Japanese/original title), fallback to a[title]
+      // Card title:
+      // - Animasu: prefer .tt (Japanese/original title), fallback to a[title]
+      // - Samehadaku .animpost: title is in a[title] or h2 text
       const ttText = $el.find('.tt').first().text().trim()
+      const h2Text = $el.find('h2').first().text().trim()
       const anchorTitle = $anchor.attr('title') ?? ''
-      const cardTitle = ttText !== '' ? ttText : anchorTitle
+      const cardTitle = ttText !== '' ? ttText : anchorTitle !== '' ? anchorTitle : h2Text
 
       if (href === '' || img === '') return
 
@@ -238,10 +243,11 @@ async function discoverOppositeSlug(
   const targetProvider = sourceProvider === 'samehadaku' ? 'animasu' : 'samehadaku'
 
   // Build search query list — ordered from most specific to most lenient:
-  // 1. English title (e.g. "SI-VIS: The Sound of Heroes")
-  // 2. Romaji title  (e.g. "SI-VIS: The Sound of Heroes" — often same)
-  // 3. Pre-colon truncation (e.g. "SI-VIS") — for providers that use short slugs
-  // 4. First 3 words  (e.g. "SI-VIS The") — last resort broad search
+  // 1. Full title as-is   (e.g. "Jigokuraku 2nd Season", "Hell's Paradise Season 2")
+  // 2. Pre-colon prefix   (e.g. "Hell's Paradise") — for colon-subtitle titles
+  // 3. Base title only    (e.g. "Jigokuraku") — strip season/cour/part suffix entirely
+  //                        ↑ critical for providers that index by base series name
+  // 4. First 3 words      (e.g. "Hell's Paradise") — last resort broad search
   const rawTitles = [jikanAnime.title_english, jikanAnime.title].filter(
     (t): t is string => t !== null && t.length > 0
   )
@@ -249,28 +255,36 @@ async function discoverOppositeSlug(
   const queryTitles: string[] = []
   const seen = new Set<string>()
 
-  for (const t of rawTitles) {
-    if (!seen.has(t)) {
-      seen.add(t)
-      queryTitles.push(t)
+  const addQuery = (q: string): void => {
+    const trimmed = q.trim()
+    if (trimmed.length > 1 && !seen.has(trimmed)) {
+      seen.add(trimmed)
+      queryTitles.push(trimmed)
     }
+  }
 
-    // If title contains colon, add the prefix as a separate shorter query
+  for (const t of rawTitles) {
+    // 1. Full title
+    addQuery(t)
+
+    // 2. Pre-colon prefix (e.g. "Hell's Paradise: Jigokuraku" → "Hell's Paradise")
     const colonIdx = t.indexOf(':')
     if (colonIdx > 0) {
-      const prefix = t.slice(0, colonIdx).trim()
-      if (prefix.length > 1 && !seen.has(prefix)) {
-        seen.add(prefix)
-        queryTitles.push(prefix)
-      }
+      addQuery(t.slice(0, colonIdx))
     }
 
-    // First 3 words as fallback broad query (min 8 chars to avoid noise)
+    // 3. Base title — strip season/cour/part/S\d suffix and everything after
+    //    e.g. "Jigokuraku 2nd Season" → "Jigokuraku"
+    //    e.g. "Hell's Paradise Season 2" → "Hell's Paradise"
+    const baseTitle = t
+      .replace(/\s*(season|cour|part|s)\s*\d+.*/gi, '')
+      .replace(/\s*\d+(st|nd|rd|th)\s*season.*/gi, '')
+      .trim()
+    addQuery(baseTitle)
+
+    // 4. First 3 words as broad fallback (min 8 chars to avoid noise)
     const firstThree = t.split(/\s+/).slice(0, 3).join(' ')
-    if (firstThree.length >= 8 && !seen.has(firstThree)) {
-      seen.add(firstThree)
-      queryTitles.push(firstThree)
-    }
+    if (firstThree.length >= 8) addQuery(firstThree)
   }
 
   Logger.info(`🔎 Discovering ${targetProvider} slug via search for: "${queryTitles[0] ?? ''}"`)
@@ -399,23 +413,61 @@ async function discoverOppositeSlug(
   const directSlugs: string[] = []
   const directSeen = new Set<string>()
 
+  const addDirectSlug = (s: string): void => {
+    if (s !== '' && !directSeen.has(s)) {
+      directSeen.add(s)
+      directSlugs.push(s)
+    }
+  }
+
+  // Season suffix variants to append to base slug when looking for sequels.
+  // e.g. base "jigokuraku" → try "jigokuraku-season-2", "jigokuraku-2nd-season", etc.
+  const seasonVariantSuffixes = (n: number): string[] => [
+    `-season-${n}`,
+    `-${n}nd-season`,
+    `-${n}rd-season`,
+    `-${n}st-season`,
+    `-${n}th-season`,
+    `-part-${n}`,
+    `-cour-${n}`,
+    `-s${n}`,
+  ]
+
+  // Detect season number from MAL title (e.g. "Jigokuraku 2nd Season" → 2)
+  const seasonMatch = /(\d+)(st|nd|rd|th)\s*season|season\s*(\d+)|part\s*(\d+)|cour\s*(\d+)/i.exec(
+    jikanAnime.title
+  )
+  const seasonNum =
+    seasonMatch !== null
+      ? parseInt(seasonMatch[1] ?? seasonMatch[3] ?? seasonMatch[4] ?? seasonMatch[5] ?? '0', 10)
+      : null
+
   for (const t of [jikanAnime.title_english, jikanAnime.title, jikanAnime.title_japanese].filter(
     (x): x is string => x !== null && x.length > 0
   )) {
-    // Full slug
+    // Full canonical slug (season info stripped by createCanonicalSlug)
     const full = AnimeNormalizer.createCanonicalSlug(t)
-    if (full !== '' && !directSeen.has(full)) {
-      directSeen.add(full)
-      directSlugs.push(full)
-    }
+    addDirectSlug(full)
 
     // Pre-colon prefix slug (e.g. "SI-VIS: The Sound of Heroes" → "si-vis")
     const colonIdx = t.indexOf(':')
     if (colonIdx > 0) {
-      const prefix = AnimeNormalizer.createCanonicalSlug(t.slice(0, colonIdx))
-      if (prefix !== '' && !directSeen.has(prefix)) {
-        directSeen.add(prefix)
-        directSlugs.push(prefix)
+      addDirectSlug(AnimeNormalizer.createCanonicalSlug(t.slice(0, colonIdx)))
+    }
+
+    // Base title slug (strip season suffix from title before slugging)
+    const baseTitle = t
+      .replace(/\s*(season|cour|part|s)\s*\d+.*/gi, '')
+      .replace(/\s*\d+(st|nd|rd|th)\s*season.*/gi, '')
+      .trim()
+    const baseSlug = AnimeNormalizer.createCanonicalSlug(baseTitle)
+    addDirectSlug(baseSlug)
+
+    // Season slug variants — append known season suffixes to base slug
+    // e.g. "jigokuraku" + "-season-2" → "jigokuraku-season-2"
+    if (baseSlug !== '' && seasonNum !== null && seasonNum >= 2) {
+      for (const suffix of seasonVariantSuffixes(seasonNum)) {
+        addDirectSlug(`${baseSlug}${suffix}`)
       }
     }
   }
@@ -496,9 +548,17 @@ async function discoverOppositeSlug(
         return { slug: directSlug, phash: null }
       }
     } else {
-      // Title confirmed, no metadata to contradict — accept on title alone
-      Logger.success(`✅ Direct slug title-only match: ${targetProvider}/${directSlug}`)
-      return { slug: directSlug, phash: null }
+      // Title confirmed, no metadata to contradict.
+      // Only accept title-only if the MAL title has NO season markers —
+      // otherwise we risk accepting Season 1 when Season 2 was requested.
+      const hasSeasonMarker =
+        /season|cour|part|\d+(st|nd|rd|th)\s*season/i.test(jikanAnime.title) ||
+        /season|cour|part|\d+(st|nd|rd|th)\s*season/i.test(jikanAnime.title_english ?? '')
+      if (!hasSeasonMarker) {
+        Logger.success(`✅ Direct slug title-only match: ${targetProvider}/${directSlug}`)
+        return { slug: directSlug, phash: null }
+      }
+      Logger.debug(`  Title-only unsafe for multi-season title "${jikanAnime.title}" — skipping`)
     }
   }
 
@@ -590,7 +650,18 @@ async function runDiscovery(
         EPISODE_COUNT_TOLERANCE
       )
 
-      if (isExact || metaOk) {
+      // ── Acceptance gate ────────────────────────────────────────────────────
+      // Title similarity (isExact) alone is NOT sufficient when year is known.
+      // A high title score for "Jigokuraku" would match both Season 1 and
+      // Season 2 — only metadata can distinguish them.
+      //
+      // Rules:
+      //  - If scraped year is known  → BOTH isExact AND metaOk are REQUIRED
+      //  - If scraped year is unknown → title similarity alone is enough (no metadata to check)
+      const hasKnownYear = detail.year !== null
+      const accepted = hasKnownYear ? isExact && metaOk : isExact || metaOk
+
+      if (accepted) {
         const confidence = isExact && metaOk ? 1.0 : isExact ? 0.9 : 0.75
         matchResult = {
           method: isExact ? 'jikan_exact' : 'jikan_fuzzy',
@@ -605,7 +676,8 @@ async function runDiscovery(
         )
       } else {
         Logger.warning(
-          `⚠️  Jikan candidate "${jikanResult.title}" failed metadata validation — skipping`
+          `⚠️  Jikan candidate "${jikanResult.title}" (year=${jikanResult.year ?? '?'}) ` +
+            `failed validation for ${provider}/${slug} (scraped year=${detail.year ?? '?'}) — skipping`
         )
       }
     }

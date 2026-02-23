@@ -122,6 +122,8 @@ export const AnimeNormalizer = {
           if (!existing.sources.includes(item.provider)) {
             existing.sources.push(item.provider)
           }
+          // Store the original provider slug so consumers can build the correct URL
+          existing.providerSlugs[item.provider] = item.slugs
           matched = true
           break
         }
@@ -131,9 +133,11 @@ export const AnimeNormalizer = {
         slugMap.set(canonicalSlug, {
           name: cleanedName,
           cover: item.cover,
-          slugs: canonicalSlug,
+          // slugs = original slug from the primary provider (not canonical)
+          slugs: item.slugs,
           provider: item.provider,
           sources: [item.provider],
+          providerSlugs: { [item.provider]: item.slugs },
         })
       }
     }
