@@ -1,5 +1,6 @@
 import { Logger } from '../utils/logger'
 
+import { resolveMega } from './resolvers/mega'
 import { resolveVidhidepro } from './resolvers/vidhidepro'
 
 /**
@@ -11,6 +12,7 @@ import { resolveVidhidepro } from './resolvers/vidhidepro'
  *
  * Supported providers:
  * - vidhidepro.com / vidhidefast.com / callistanise.com → resolveVidhidepro
+ * - mega.nz → resolveMega
  */
 export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> {
   let hostname: string
@@ -28,6 +30,11 @@ export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> 
     hostname.includes('callistanise')
   ) {
     return await resolveVidhidepro(embedUrl)
+  }
+
+  // ── Mega.nz ──────────────────────────────────────────────────────────────────
+  if (hostname.includes('mega.nz') || hostname === 'mega.nz') {
+    return await resolveMega(embedUrl)
   }
 
   // ── No resolver available ────────────────────────────────────────────────────
