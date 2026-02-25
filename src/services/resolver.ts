@@ -2,9 +2,7 @@ import { Logger } from '../utils/logger'
 
 import { resolveFiledon } from './resolvers/filedon'
 import { resolveMega } from './resolvers/mega'
-import { resolveMp4upload } from './resolvers/mp4upload'
 import { resolveVidhidepro } from './resolvers/vidhidepro'
-import { resolveYourupload } from './resolvers/yourupload'
 
 /**
  * resolveEmbedUrl — Dispatches an embed URL to the correct resolver based on hostname.
@@ -17,8 +15,10 @@ import { resolveYourupload } from './resolvers/yourupload'
  * - vidhidepro.com / vidhidefast.com / callistanise.com → resolveVidhidepro
  * - mega.nz → resolveMega
  * - filedon.co → resolveFiledon
- * - mp4upload.com → resolveMp4upload
- * - yourupload.com → resolveYourupload
+ *
+ * Providers NOT supported (CDN requires Referer header — not usable by clients directly):
+ * - mp4upload.com — CDN cek Referer: https://www.mp4upload.com/
+ * - yourupload.com — CDN cek Referer: https://www.yourupload.com/
  */
 export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> {
   let hostname: string
@@ -46,16 +46,6 @@ export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> 
   // ── Filedon ──────────────────────────────────────────────────────────────────
   if (hostname === 'filedon.co' || hostname.endsWith('.filedon.co')) {
     return await resolveFiledon(embedUrl)
-  }
-
-  // ── Mp4upload ─────────────────────────────────────────────────────────────────
-  if (hostname === 'www.mp4upload.com' || hostname === 'mp4upload.com') {
-    return await resolveMp4upload(embedUrl)
-  }
-
-  // ── Yourupload ────────────────────────────────────────────────────────────────
-  if (hostname === 'www.yourupload.com' || hostname === 'yourupload.com') {
-    return await resolveYourupload(embedUrl)
   }
 
   // ── No resolver available ────────────────────────────────────────────────────
