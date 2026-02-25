@@ -6,6 +6,8 @@ import type { StreamingServer } from '../types/anime'
 import { fetchHTML } from '../utils/fetcher'
 import { Logger } from '../utils/logger'
 
+import { resolveEmbedUrl } from './resolver'
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -108,8 +110,15 @@ async function scrapeAnimasuStreaming(
       // Compose provider label: "Vidhidepro 720p" or just "Vidhidepro"
       const providerLabel = resolution !== null ? `${serverName} ${resolution}` : serverName
 
-      servers.push({ provider: providerLabel, url: embedUrl, resolution })
+      servers.push({ provider: providerLabel, url: embedUrl, url_resolved: null, resolution })
     })
+
+    // ── Resolve embed URLs concurrently ────────────────────────────────────────
+    await Promise.all(
+      servers.map(async (server) => {
+        server.url_resolved = await resolveEmbedUrl(server.url)
+      })
+    )
 
     Logger.debug(`  ✅ Animasu: found ${servers.length} streaming servers`)
     return servers.length > 0 ? servers : null
@@ -255,8 +264,15 @@ async function scrapeSamehadakuStreaming(
     const serverBase = opt.label.replace(/\s*\d{3,4}p\s*$/i, '').trim()
     const providerLabel = serverBase.length > 0 ? opt.label : serverNameFromUrl(embedUrl)
 
-    servers.push({ provider: providerLabel, url: embedUrl, resolution })
+    servers.push({ provider: providerLabel, url: embedUrl, url_resolved: null, resolution })
   }
+
+  // ── Resolve embed URLs concurrently ──────────────────────────────────────────
+  await Promise.all(
+    servers.map(async (server) => {
+      server.url_resolved = await resolveEmbedUrl(server.url)
+    })
+  )
 
   Logger.debug(`  ✅ Samehadaku: found ${servers.length} streaming servers`)
   return servers.length > 0 ? servers : null

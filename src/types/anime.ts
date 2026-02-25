@@ -164,13 +164,15 @@ export interface GenreSearchResponse {
 
 /**
  * A single streaming server/mirror entry.
- * - provider: server name, e.g. "Vidhidepro 720p", "Mega 1080p"
- * - url:      embed URL (iframe src)
- * - resolution: quality string extracted from label, e.g. "720p", "480p", null if unknown
+ * - provider:     server name, e.g. "Vidhidepro 720p", "Mega 1080p"
+ * - url:          embed URL (iframe src)
+ * - url_resolved: direct video/m3u8 URL after resolving the embed, null if resolver not available or failed
+ * - resolution:   quality string extracted from label, e.g. "720p", "480p", null if unknown
  */
 export interface StreamingServer {
   provider: string
   url: string
+  url_resolved: string | null
   resolution: string | null
 }
 
