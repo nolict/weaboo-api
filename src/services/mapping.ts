@@ -33,7 +33,24 @@ const enrichmentLocks = new Map<string, Promise<AnimeMapping | null>>()
 async function scrapeAnimasuDetail(slug: string): Promise<AnimeDetailScrape | null> {
   try {
     const url = `${PROVIDERS.ANIMASU.baseUrl}/anime/${slug}/`
-    const html = await fetchHTML(url)
+
+    // Animasu works with native fetch() — axios with short UA gets blocked by Cloudflare
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      },
+    })
+
+    if (!res.ok) {
+      Logger.warning(`⚠️  Animasu detail HTTP ${res.status} for slug "${slug}"`)
+      return null
+    }
+
+    const html = await res.text()
     const $ = cheerio.load(html)
 
     // Title: prefer .entry-title / h1, fallback to page <title>
@@ -42,13 +59,20 @@ async function scrapeAnimasuDetail(slug: string): Promise<AnimeDetailScrape | nu
     const titleTag = $('title').text().split('|')[0].trim()
     const title = h1Entry !== '' ? h1Entry : h1Generic !== '' ? h1Generic : titleTag
 
-    // Cover: og:image is most reliable on Animasu
-    const coverUrl =
-      $('meta[property="og:image"]').attr('content') ??
-      $('img.attachment-post-thumbnail').attr('src') ??
-      ''
+    // Cover: og:image (older anime pages may not have it) → fallback to
+    // first wp.com / animasu-hosted image found in the page (data-src or src)
+    let coverUrl = $('meta[property="og:image"]').attr('content') ?? ''
 
-    // Year: Animasu uses "Rilis: Jan 6, 2026" format in .spe span
+    if (coverUrl === '' || !isCoverUrlValid(coverUrl, 'animasu')) {
+      // Walk all img tags, pick first one hosted on WordPress CDN or animasu domain
+      $('img').each((_, el) => {
+        if (coverUrl !== '') return false // already found
+        const src = $(el).attr('src') ?? $(el).attr('data-src') ?? $(el).attr('data-lazy-src') ?? ''
+        if (isCoverUrlValid(src, 'animasu')) coverUrl = src
+      })
+    }
+
+    // Year: Animasu uses "Rilis: Jan 6, 2026" or "Rilis: 2004" format in .spe span
     let year: number | null = null
     $('div.spe span').each((_, el) => {
       const text = $(el).text().trim()
@@ -507,6 +531,15 @@ async function discoverOppositeSlug(
       for (const suffix of seasonVariantSuffixes(seasonNum)) {
         addDirectSlug(`${baseSlug}${suffix}`)
       }
+    }
+
+    // Year-suffixed slug variants — some providers append release year to disambiguate
+    // e.g. Animasu "monster-2004" for MAL title "Monster" (year=2004)
+    if (baseSlug !== '' && jikanAnime.year !== null) {
+      addDirectSlug(`${baseSlug}-${jikanAnime.year}`)
+    }
+    if (full !== '' && jikanAnime.year !== null && full !== baseSlug) {
+      addDirectSlug(`${full}-${jikanAnime.year}`)
     }
   }
 
