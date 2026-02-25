@@ -1,5 +1,6 @@
 import { Logger } from '../utils/logger'
 
+import { resolveFiledon } from './resolvers/filedon'
 import { resolveMega } from './resolvers/mega'
 import { resolveVidhidepro } from './resolvers/vidhidepro'
 
@@ -13,6 +14,7 @@ import { resolveVidhidepro } from './resolvers/vidhidepro'
  * Supported providers:
  * - vidhidepro.com / vidhidefast.com / callistanise.com → resolveVidhidepro
  * - mega.nz → resolveMega
+ * - filedon.co → resolveFiledon
  */
 export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> {
   let hostname: string
@@ -33,8 +35,13 @@ export async function resolveEmbedUrl(embedUrl: string): Promise<string | null> 
   }
 
   // ── Mega.nz ──────────────────────────────────────────────────────────────────
-  if (hostname.includes('mega.nz') || hostname === 'mega.nz') {
+  if (hostname === 'mega.nz' || hostname.endsWith('.mega.nz')) {
     return await resolveMega(embedUrl)
+  }
+
+  // ── Filedon ──────────────────────────────────────────────────────────────────
+  if (hostname === 'filedon.co' || hostname.endsWith('.filedon.co')) {
+    return await resolveFiledon(embedUrl)
   }
 
   // ── No resolver available ────────────────────────────────────────────────────
