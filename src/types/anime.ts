@@ -160,6 +160,33 @@ export interface GenreSearchResponse {
   data: GenreSearchItem[]
 }
 
+// ── Streaming server types ────────────────────────────────────────────────────
+
+/**
+ * A single streaming server/mirror entry.
+ * - provider: server name, e.g. "Vidhidepro 720p", "Mega 1080p"
+ * - url:      embed URL (iframe src)
+ * - resolution: quality string extracted from label, e.g. "720p", "480p", null if unknown
+ */
+export interface StreamingServer {
+  provider: string
+  url: string
+  resolution: string | null
+}
+
+export interface StreamingList {
+  animasu: StreamingServer[] | null
+  samehadaku: StreamingServer[] | null
+}
+
+export interface StreamingResponse {
+  success: boolean
+  mal_id: number
+  episode: number
+  data: StreamingList | null
+  error?: string
+}
+
 // ── Multi-factor match result (internal) ─────────────────────────────────────
 
 export type MatchMethod = 'phash' | 'jikan_fuzzy' | 'jikan_exact' | 'none'
