@@ -1,9 +1,10 @@
-import { API_VERSION, PORT } from './config/constants'
+import { API_VERSION, HF_FILE_SALT, PORT } from './config/constants'
 import { AnimeController } from './controllers/anime'
 import { HomeController } from './controllers/home'
 import { SearchController } from './controllers/search'
 import { StreamingController } from './controllers/streaming'
 import { loggerMiddleware } from './middleware/logger'
+import { invalidateStreamingCache } from './services/streaming'
 import { Logger } from './utils/logger'
 
 const homeController = new HomeController()
@@ -15,6 +16,7 @@ const streamingController = new StreamingController()
 const ANIME_ROUTE_RE = new RegExp(`^/api/${API_VERSION}/anime/([^/]+)$`)
 const ANIME_BY_MAL_RE = new RegExp(`^/api/${API_VERSION}/anime/mal/(\\d+)$`)
 const STREAMING_ROUTE_RE = new RegExp(`^/api/${API_VERSION}/streaming/(\\d+)/(\\d+)$`)
+const STREAMING_INVALIDATE_ROUTE = `/api/${API_VERSION}/streaming/invalidate`
 
 const server = Bun.serve({
   port: PORT,
@@ -37,6 +39,86 @@ const server = Bun.serve({
           url.searchParams.get('genre'),
           url.searchParams.get('page')
         )
+      }
+
+      // POST /api/v1/streaming/invalidate — invalidate streaming cache
+      if (req.method === 'POST' && path === STREAMING_INVALIDATE_ROUTE) {
+        try {
+          const body = await req.json()
+          const {
+            mal_id: malId,
+            episode,
+            secret,
+          } = body as {
+            mal_id?: unknown
+            episode?: unknown
+            secret?: unknown
+          }
+
+          // Validate secret
+          if (secret !== HF_FILE_SALT) {
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: 'Unauthorized',
+                message: 'Invalid secret',
+              }),
+              {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' },
+              }
+            )
+          }
+
+          // Validate malId and episode
+          if (
+            typeof malId !== 'number' ||
+            typeof episode !== 'number' ||
+            !Number.isInteger(malId) ||
+            !Number.isInteger(episode) ||
+            malId <= 0 ||
+            episode <= 0
+          ) {
+            return new Response(
+              JSON.stringify({
+                success: false,
+                error: 'Bad Request',
+                message: 'mal_id and episode must be positive integers',
+              }),
+              {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' },
+              }
+            )
+          }
+
+          // Invalidate cache
+          invalidateStreamingCache(malId, episode)
+
+          return new Response(
+            JSON.stringify({
+              success: true,
+              invalidated: true,
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          )
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: 'Bad Request',
+              message: `JSON parse error: ${msg}`,
+            }),
+            {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          )
+        }
       }
 
       // GET /api/v1/streaming/:malId/:episode

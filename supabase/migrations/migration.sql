@@ -249,3 +249,219 @@ BEGIN
   RETURN result;
 END;
 $$;
+
+-- ============================================================
+-- WEABOO API — HuggingFace Storage Migration
+-- Tables: video_queue, video_store
+-- Purpose: Queue system for downloading and uploading anime
+--          episode videos to HuggingFace Dataset storage,
+--          served via Cloudflare Workers proxy.
+-- ============================================================
+
+-- ============================================================
+-- TABLE: video_queue
+-- Antrian download & upload per episode per provider per resolution.
+-- Status flow: pending → downloading → uploading → ready | failed
+-- ============================================================
+CREATE TABLE IF NOT EXISTS video_queue (
+  id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  mal_id         INTEGER      NOT NULL,
+  episode        INTEGER      NOT NULL,
+  provider       VARCHAR(20)  NOT NULL, -- 'animasu' | 'samehadaku'
+  video_url      TEXT         NOT NULL, -- url_resolved dari resolver (direct video/m3u8)
+  resolution     VARCHAR(10),           -- '480p' | '720p' | '1080p' | NULL
+  status         VARCHAR(20)  NOT NULL DEFAULT 'pending',
+                                        -- pending | downloading | uploading | ready | failed
+  retry_count    INTEGER      NOT NULL DEFAULT 0,
+  error_message  TEXT,                  -- pesan error terakhir jika status = failed
+  created_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+
+  CONSTRAINT uq_video_queue UNIQUE (mal_id, episode, provider, resolution),
+  CONSTRAINT chk_video_queue_status CHECK (
+    status IN ('pending', 'downloading', 'uploading', 'ready', 'failed')
+  ),
+  CONSTRAINT chk_video_queue_provider CHECK (
+    provider IN ('animasu', 'samehadaku')
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_queue_status     ON video_queue (status);
+CREATE INDEX IF NOT EXISTS idx_video_queue_mal_ep     ON video_queue (mal_id, episode);
+CREATE INDEX IF NOT EXISTS idx_video_queue_updated_at ON video_queue (updated_at DESC);
+
+-- ============================================================
+-- TABLE: video_store
+-- Hasil upload ke HuggingFace Dataset.
+-- Setiap row = satu file video yang sudah berhasil di-upload.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS video_store (
+  id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  mal_id         INTEGER      NOT NULL,
+  episode        INTEGER      NOT NULL,
+  provider       VARCHAR(20)  NOT NULL, -- 'animasu' | 'samehadaku'
+  resolution     VARCHAR(10),           -- '480p' | '720p' | '1080p' | NULL
+
+  -- File identity (obfuscated)
+  file_key       VARCHAR(64)  NOT NULL, -- SHA-256 hash (32 hex chars) sebagai filename
+
+  -- HuggingFace storage info
+  hf_account     INTEGER      NOT NULL, -- index 1-5 (akun storage ke berapa)
+  hf_repo        TEXT         NOT NULL, -- full repo id, e.g. 'username1/weaboo-55825'
+  hf_path        TEXT         NOT NULL, -- path di dalam repo, e.g. '55825/ep1/abc123.mp4'
+  hf_direct_url  TEXT         NOT NULL, -- HF raw download URL (public, obfuscated filename)
+
+  -- Cloudflare Workers proxy URL (served ke user)
+  stream_url     TEXT         NOT NULL, -- https://worker.workers.dev/stream/:malId/:ep/:provider/:res
+
+  created_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+
+  CONSTRAINT uq_video_store UNIQUE (mal_id, episode, provider, resolution),
+  CONSTRAINT chk_video_store_provider CHECK (
+    provider IN ('animasu', 'samehadaku')
+  ),
+  CONSTRAINT chk_video_store_account CHECK (
+    hf_account BETWEEN 1 AND 5
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_store_mal_ep ON video_store (mal_id, episode);
+CREATE INDEX IF NOT EXISTS idx_video_store_lookup ON video_store (mal_id, episode, provider, resolution);
+
+-- ============================================================
+-- FUNCTION: enqueue_video
+-- ============================================================
+CREATE OR REPLACE FUNCTION enqueue_video(
+  p_mal_id     INTEGER,
+  p_episode    INTEGER,
+  p_provider   VARCHAR(20),
+  p_video_url  TEXT,
+  p_resolution VARCHAR(10) DEFAULT NULL
+)
+RETURNS video_queue
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  result video_queue;
+BEGIN
+  INSERT INTO video_queue (mal_id, episode, provider, video_url, resolution, status)
+  VALUES (p_mal_id, p_episode, p_provider, p_video_url, p_resolution, 'pending')
+  ON CONFLICT (mal_id, episode, provider, resolution) DO UPDATE SET
+    video_url   = CASE
+                    WHEN video_queue.status = 'ready' THEN video_queue.video_url
+                    ELSE EXCLUDED.video_url
+                  END,
+    status      = CASE
+                    WHEN video_queue.status IN ('failed') THEN 'pending'
+                    ELSE video_queue.status
+                  END,
+    updated_at  = NOW()
+  RETURNING * INTO result;
+
+  RETURN result;
+END;
+$$;
+
+-- ============================================================
+-- FUNCTION: claim_pending_videos
+-- ============================================================
+CREATE OR REPLACE FUNCTION claim_pending_videos(p_limit INTEGER DEFAULT 5)
+RETURNS SETOF video_queue
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE video_queue
+  SET status     = 'downloading',
+      updated_at = NOW()
+  WHERE id IN (
+    SELECT id FROM video_queue
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT p_limit
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING *;
+END;
+$$;
+
+-- ============================================================
+-- FUNCTION: update_video_queue_status
+-- ============================================================
+CREATE OR REPLACE FUNCTION update_video_queue_status(
+  p_id           UUID,
+  p_status       VARCHAR(20),
+  p_error        TEXT DEFAULT NULL
+)
+RETURNS video_queue
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  result video_queue;
+BEGIN
+  UPDATE video_queue
+  SET status        = p_status,
+      error_message = COALESCE(p_error, error_message),
+      retry_count   = CASE WHEN p_status = 'failed' THEN retry_count + 1 ELSE retry_count END,
+      updated_at    = NOW()
+  WHERE id = p_id
+  RETURNING * INTO result;
+
+  RETURN result;
+END;
+$$;
+
+-- ============================================================
+-- FUNCTION: upsert_video_store
+-- Simpan hasil upload HF ke video_store + mark queue sebagai ready.
+-- ============================================================
+CREATE OR REPLACE FUNCTION upsert_video_store(
+  p_mal_id        INTEGER,
+  p_episode       INTEGER,
+  p_provider      VARCHAR(20),
+  p_resolution    VARCHAR(10),
+  p_file_key      VARCHAR(64),
+  p_hf_account    INTEGER,
+  p_hf_repo       TEXT,
+  p_hf_path       TEXT,
+  p_hf_direct_url TEXT,
+  p_stream_url    TEXT
+)
+RETURNS video_store
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  result video_store;
+BEGIN
+  INSERT INTO video_store (
+    mal_id, episode, provider, resolution,
+    file_key, hf_account, hf_repo, hf_path,
+    hf_direct_url, stream_url
+  )
+  VALUES (
+    p_mal_id, p_episode, p_provider, p_resolution,
+    p_file_key, p_hf_account, p_hf_repo, p_hf_path,
+    p_hf_direct_url, p_stream_url
+  )
+  ON CONFLICT (mal_id, episode, provider, resolution) DO UPDATE SET
+    file_key      = EXCLUDED.file_key,
+    hf_account    = EXCLUDED.hf_account,
+    hf_repo       = EXCLUDED.hf_repo,
+    hf_path       = EXCLUDED.hf_path,
+    hf_direct_url = EXCLUDED.hf_direct_url,
+    stream_url    = EXCLUDED.stream_url,
+    created_at    = NOW()
+  RETURNING * INTO result;
+
+  -- Mark queue entry sebagai ready juga
+  UPDATE video_queue
+  SET status     = 'ready',
+      updated_at = NOW()
+  WHERE mal_id = p_mal_id
+    AND episode = p_episode
+    AND provider = p_provider
+    AND (resolution = p_resolution OR (resolution IS NULL AND p_resolution IS NULL));
+
+  RETURN result;
+END;
+$$;

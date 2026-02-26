@@ -131,3 +131,23 @@ export const PHASH_HEX_LENGTH = 64
 // MAL metadata cache: permanent (in-memory for process lifetime, Supabase persists forever)
 // Episode list cache: 20 minutes (TTL in milliseconds)
 export const EPISODE_CACHE_TTL_MS = 20 * 60 * 1000
+
+// ── Cloudflare Workers (video stream proxy) ──────────────────────────────────
+// Base URL of the deployed Cloudflare Worker that proxies video streams.
+// Pattern: GET {CF_WORKERS_BASE_URL}/stream/:malId/:episode/:provider/:resolution
+// Set via environment variable CLOUDFLARE_WORKERS_URL.
+export const CF_WORKERS_BASE_URL: string = process.env.CLOUDFLARE_WORKERS_URL ?? ''
+
+// ── HuggingFace Space (background video worker) ──────────────────────────────
+// Webhook URL of the FastAPI app running in the HuggingFace Space.
+// Called fire-and-forget to trigger immediate processing of a new queue entry.
+// Set via environment variable HF_SPACE_WEBHOOK_URL.
+export const HF_SPACE_WEBHOOK_URL: string = process.env.HF_SPACE_WEBHOOK_URL ?? ''
+
+// ── HuggingFace storage config ───────────────────────────────────────────────
+// Number of storage accounts (1 worker space + N storage accounts).
+export const HF_STORAGE_ACCOUNT_COUNT = 5
+
+// Secret salt used to obfuscate video filenames in HuggingFace datasets.
+// Must match the salt used in the HF Space Python app.
+export const HF_FILE_SALT: string = process.env.HF_FILE_SALT ?? 'weaboo-default-salt'

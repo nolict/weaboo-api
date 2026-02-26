@@ -168,12 +168,56 @@ export interface GenreSearchResponse {
  * - url:          embed URL (iframe src)
  * - url_resolved: direct video/m3u8 URL after resolving the embed, null if resolver not available or failed
  * - resolution:   quality string extracted from label, e.g. "720p", "480p", null if unknown
+ * - stream:       Cloudflare Workers proxy URL — serves from HuggingFace if video is archived,
+ *                 otherwise proxies url_resolved directly. null if url_resolved is unavailable.
  */
 export interface StreamingServer {
   provider: string
   url: string
   url_resolved: string | null
   resolution: string | null
+  stream: string | null
+}
+
+// ── Video queue / HuggingFace storage types ───────────────────────────────────
+
+export type VideoQueueStatus = 'pending' | 'downloading' | 'uploading' | 'ready' | 'failed'
+
+/**
+ * Row in the video_queue Supabase table.
+ * Represents one download+upload job per unique (mal_id, episode, provider, resolution).
+ */
+export interface VideoQueueEntry {
+  id: string
+  mal_id: number
+  episode: number
+  provider: string
+  video_url: string
+  resolution: string | null
+  status: VideoQueueStatus
+  retry_count: number
+  error_message: string | null
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Row in the video_store Supabase table.
+ * Represents a successfully uploaded video file on HuggingFace Dataset.
+ */
+export interface VideoStoreEntry {
+  id: string
+  mal_id: number
+  episode: number
+  provider: string
+  resolution: string | null
+  file_key: string // obfuscated filename (SHA-256 hash prefix)
+  hf_account: number // storage account index 1-5
+  hf_repo: string // e.g. 'username1/anime-storage'
+  hf_path: string // e.g. '55825/ep1/abc123def456.mp4'
+  hf_direct_url: string // HF raw download URL
+  stream_url: string // Cloudflare Workers proxy URL
+  created_at: string
 }
 
 export interface StreamingList {

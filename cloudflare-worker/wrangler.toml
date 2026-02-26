@@ -1,0 +1,25 @@
+name = "weaboo-stream"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Environment variables ────────────────────────────────────────────────────
+# Set these via `wrangler secret put` or in the CF dashboard (never commit real values!)
+#
+#   wrangler secret put SUPABASE_URL
+#   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+
+[vars]
+# Public vars (non-sensitive) can go here
+WORKER_VERSION = "1.0.0"
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+# Uncomment and configure after deploying:
+# [[routes]]
+# pattern = "stream.yourdomain.com/*"
+# zone_name = "yourdomain.com"
+
+# ── Limits ───────────────────────────────────────────────────────────────────
+# cpu_ms limit hanya tersedia di paid plan — jangan uncomment jika pakai free plan
+# [limits]
+# cpu_ms = 30000

@@ -1,12 +1,45 @@
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 
-import { PROVIDERS } from '../config/constants'
+import { PROVIDERS, HF_SPACE_WEBHOOK_URL, EPISODE_CACHE_TTL_MS } from '../config/constants'
+import { findVideoStore, enqueueVideo, findVideoQueueEntry } from '../lib/videoQueue'
 import type { StreamingServer } from '../types/anime'
 import { fetchHTML } from '../utils/fetcher'
 import { Logger } from '../utils/logger'
 
+import { buildStreamUrl, triggerHfSpaceWebhook } from './cfWorkers'
 import { resolveEmbedUrl } from './resolver'
+
+// ── Streaming cache ───────────────────────────────────────────────────────────
+
+interface StreamingCacheEntry {
+  // Raw scraped servers — cached 20 min, HF store always checked fresh per-request
+  animasu: StreamingServer[] | null
+  samehadaku: StreamingServer[] | null
+  expiresAt: number
+}
+
+/**
+ * Two-tier streaming cache:
+ * - Key: `${malId}:${episode}`
+ * - TTL: EPISODE_CACHE_TTL_MS (20 min) for raw scrape results (embed URLs + url_resolved)
+ * - HF store always checked fresh per-request (Supabase ~20ms) — no permanent TTL needed
+ * - url_resolved updates automatically to HF URL once video_store has the entry
+ */
+const streamingCache = new Map<string, StreamingCacheEntry>()
+
+/**
+ * Invalidate the streaming cache for a specific malId+episode.
+ * Called when HuggingFace upload completes so the next fetch
+ * immediately reflects the new HF url_resolved.
+ */
+export function invalidateStreamingCache(malId: number, episode: number): void {
+  const cacheKey = `${malId}:${episode}`
+  const deleted = streamingCache.delete(cacheKey)
+  if (deleted) {
+    Logger.debug(`  🗑️  Streaming cache invalidated: ${cacheKey}`)
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -110,7 +143,13 @@ async function scrapeAnimasuStreaming(
       // Compose provider label: "Vidhidepro 720p" or just "Vidhidepro"
       const providerLabel = resolution !== null ? `${serverName} ${resolution}` : serverName
 
-      servers.push({ provider: providerLabel, url: embedUrl, url_resolved: null, resolution })
+      servers.push({
+        provider: providerLabel,
+        url: embedUrl,
+        url_resolved: null,
+        resolution,
+        stream: null,
+      })
     })
 
     // ── Resolve embed URLs concurrently ────────────────────────────────────────
@@ -264,7 +303,13 @@ async function scrapeSamehadakuStreaming(
     const serverBase = opt.label.replace(/\s*\d{3,4}p\s*$/i, '').trim()
     const providerLabel = serverBase.length > 0 ? opt.label : serverNameFromUrl(embedUrl)
 
-    servers.push({ provider: providerLabel, url: embedUrl, url_resolved: null, resolution })
+    servers.push({
+      provider: providerLabel,
+      url: embedUrl,
+      url_resolved: null,
+      resolution,
+      stream: null,
+    })
   }
 
   // ── Resolve embed URLs concurrently ──────────────────────────────────────────
@@ -278,29 +323,158 @@ async function scrapeSamehadakuStreaming(
   return servers.length > 0 ? servers : null
 }
 
+// ── HuggingFace + Cloudflare Workers integration ──────────────────────────────
+
+/**
+ * enrichWithStreamUrls — After scraping, for each StreamingServer that has a
+ * url_resolved, we:
+ *   1. Check Supabase video_store — if already archived in HuggingFace:
+ *      - set stream = CF Workers → HF URL
+ *      - set url_resolved = HF direct URL (so client can see it changed)
+ *   2. Otherwise, build a CF Workers proxy URL that streams url_resolved directly.
+ *   3. Fire-and-forget: enqueue + trigger HF Space webhook (only if not already queued).
+ *
+ * Returns true if ALL servers with url_resolved are fully archived in HF
+ * (so the caller can promote the cache entry to permanent).
+ */
+async function enrichWithStreamUrls(
+  servers: StreamingServer[],
+  malId: number,
+  episode: number,
+  provider: string
+): Promise<boolean> {
+  let allArchivedInHf = true
+
+  await Promise.allSettled(
+    servers.map(async (server) => {
+      // Only process servers that have a resolved direct URL
+      if (server.url_resolved === null) {
+        server.stream = null
+        // Servers with no url_resolved don't count against HF archival check
+        return
+      }
+
+      try {
+        // Step 1: Check if already archived in HuggingFace
+        const stored = await findVideoStore(malId, episode, provider, server.resolution)
+
+        if (stored !== null) {
+          // Video is ready in HuggingFace — update url_resolved to HF URL + wrap in CF proxy
+          server.url_resolved = stored.hf_direct_url
+          server.stream = buildStreamUrl(stored.hf_direct_url)
+          Logger.debug(`  📦 HF archived: ${stored.hf_direct_url}`)
+          return
+        }
+
+        // Not yet archived — cache cannot be permanent
+        allArchivedInHf = false
+
+        // Step 2: Build CF Workers proxy URL wrapping the current url_resolved directly
+        server.stream = buildStreamUrl(server.url_resolved)
+
+        // Step 3: Check if already queued (pending/downloading/uploading) — skip if so
+        const existing = await findVideoQueueEntry(malId, episode, provider, server.resolution)
+        if (existing !== null) {
+          Logger.debug(
+            `  ⏭️  Already queued (${existing.status}): mal=${malId} ep=${episode} ${provider}`
+          )
+          return
+        }
+
+        // Step 4: Enqueue for background download + upload (fire-and-forget)
+        void enqueueVideo(malId, episode, provider, server.url_resolved, server.resolution)
+
+        // Step 5: Trigger HF Space webhook for immediate processing
+        triggerHfSpaceWebhook(HF_SPACE_WEBHOOK_URL, {
+          mal_id: malId,
+          episode,
+          provider,
+          video_url: server.url_resolved,
+          resolution: server.resolution,
+        })
+      } catch {
+        // Non-fatal: stream stays null, not archived
+        allArchivedInHf = false
+        server.stream = server.url_resolved !== null ? buildStreamUrl(server.url_resolved) : null
+      }
+    })
+  )
+
+  return allArchivedInHf
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
- * getStreamingLinks — Fetches streaming embed links from both providers concurrently.
+ * getStreamingLinks — Fetches streaming embed links from both providers concurrently,
+ * enriches each server with a `stream` URL (Cloudflare Workers proxy), and
+ * fires background jobs to archive videos to HuggingFace.
+ *
+ * Cache strategy (two-tier):
+ * - 20 min TTL: normal scrape result (embed URLs expire, so we re-scrape periodically)
+ * - Permanent:  once ALL servers with url_resolved are archived to HuggingFace,
+ *               the cache entry is promoted to permanent (expiresAt = 0).
+ *               url_resolved in cached response will already point to HF URLs.
  *
  * @param slugAnimasu    - Animasu slug from the mapping (null if not available)
  * @param slugSamehadaku - Samehadaku slug from the mapping (null if not available)
  * @param episode        - Episode number to fetch
+ * @param malId          - MAL ID used for queue/store lookup and CF Workers URL
  */
 export async function getStreamingLinks(
   slugAnimasu: string | null,
   slugSamehadaku: string | null,
-  episode: number
+  episode: number,
+  malId: number
 ): Promise<{ animasu: StreamingServer[] | null; samehadaku: StreamingServer[] | null }> {
-  const [animasuResult, samehadakuResult] = await Promise.all([
-    slugAnimasu !== null ? scrapeAnimasuStreaming(slugAnimasu, episode) : Promise.resolve(null),
-    slugSamehadaku !== null
-      ? scrapeSamehadakuStreaming(slugSamehadaku, episode)
-      : Promise.resolve(null),
+  const cacheKey = `${malId}:${episode}`
+  const now = Date.now()
+
+  // ── Cache hit check (scrape results only) ──────────────────────────────────
+  // HF store is always checked fresh on every request via enrichWithStreamUrls.
+  // This means url_resolved updates automatically once video_store has HF URL —
+  // no cache invalidation needed when HF upload completes.
+  const cached = streamingCache.get(cacheKey)
+  let animasuResult: StreamingServer[] | null
+  let samehadakuResult: StreamingServer[] | null
+
+  if (cached !== undefined && cached.expiresAt > now) {
+    Logger.debug(`  ✅ Scrape cache hit (20min): ${cacheKey}`)
+    animasuResult = cached.animasu
+    samehadakuResult = cached.samehadaku
+  } else {
+    // Cache miss or expired — re-scrape both providers
+    if (cached !== undefined) streamingCache.delete(cacheKey)
+
+    const [a, s] = await Promise.all([
+      slugAnimasu !== null ? scrapeAnimasuStreaming(slugAnimasu, episode) : Promise.resolve(null),
+      slugSamehadaku !== null
+        ? scrapeSamehadakuStreaming(slugSamehadaku, episode)
+        : Promise.resolve(null),
+    ])
+    animasuResult = a
+    samehadakuResult = s
+
+    // Cache raw scrape results for 20 minutes
+    streamingCache.set(cacheKey, {
+      animasu: animasuResult,
+      samehadaku: samehadakuResult,
+      expiresAt: now + EPISODE_CACHE_TTL_MS,
+    })
+    Logger.debug(`  💾 Scrape cached (20min): ${cacheKey}`)
+  }
+
+  // ── Always check HF store fresh + enrich stream URLs ─────────────────────
+  // Runs on every request (cache hit or miss). Supabase query ~20ms.
+  // url_resolved updates to HF URL automatically once video_store has the entry.
+  await Promise.all([
+    animasuResult !== null
+      ? enrichWithStreamUrls(animasuResult, malId, episode, 'animasu')
+      : Promise.resolve(true),
+    samehadakuResult !== null
+      ? enrichWithStreamUrls(samehadakuResult, malId, episode, 'samehadaku')
+      : Promise.resolve(true),
   ])
 
-  return {
-    animasu: animasuResult,
-    samehadaku: samehadakuResult,
-  }
+  return { animasu: animasuResult, samehadaku: samehadakuResult }
 }

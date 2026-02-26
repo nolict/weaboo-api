@@ -68,7 +68,8 @@ export class StreamingController {
       const streamingData = await getStreamingLinks(
         mapping.slug_animasu,
         mapping.slug_samehadaku,
-        episode
+        episode,
+        malId
       )
 
       return this.successResponse(malId, episode, streamingData)
