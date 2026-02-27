@@ -1,6 +1,6 @@
 {
   "name": "weaboo-api",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "module": "src/index.ts",
   "type": "module",
   "scripts": {

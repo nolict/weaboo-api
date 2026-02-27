@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0](https://github.com/nolict/weaboo-api/compare/weaboo-api-v0.0.1...weaboo-api-v0.1.0) (2026-02-27)
+
+
+### Features
+
+* **providers:** add NontonAnimeid as third provider with homepage, episodes, streaming, and cross-provider mapping discovery ([25a5701](https://github.com/nolict/weaboo-api/commit/25a570158608a5f672b2516d5350b6d9bd5352e8))
+
+
+### Bug Fixes
+
+* **mapping:** fix isExact english title gate, NontonAnimeid search selector, direct slug scraper, and pHash hang ([34394df](https://github.com/nolict/weaboo-api/commit/34394dff1a45ac5a4c76ed45ea185fcabe05df9f))
+
 ## 0.0.1 (2026-02-27)
 
 
