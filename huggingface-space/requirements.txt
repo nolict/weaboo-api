@@ -3,3 +3,4 @@ uvicorn[standard]==0.32.1
 huggingface-hub==0.26.5
 supabase==2.10.0
 python-multipart==0.0.12
+pycryptodome==3.21.0

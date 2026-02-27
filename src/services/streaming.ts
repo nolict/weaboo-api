@@ -381,15 +381,39 @@ async function enrichWithStreamUrls(
           return
         }
 
-        // Step 4: Enqueue for background download + upload (fire-and-forget)
-        void enqueueVideo(malId, episode, provider, server.url_resolved, server.resolution)
+        // Step 4: Determine the correct URL to enqueue for download.
+        // For Mega: enqueue the original embed URL (mega.nz/embed/NODE#KEY) — it contains
+        // the AES key in the hash fragment that mega.py needs for decryption.
+        // Enqueueing the CDN url_resolved (gfs...mega.co.nz) would download encrypted bytes.
+        // For all other providers: enqueue url_resolved (direct CDN URL).
+        // Providers where url_resolved has ASN-bound or expiring tokens:
+        // - Mega: CDN URL has no AES key → need embed URL with #KEY fragment
+        // - Vidhidepro: HLS token is ASN-bound to API server IP → re-resolve in HF Space
+        // For these, enqueue embed URL so HF Space resolves fresh with its own ASN.
+        const needsEmbedUrl = (u: string): boolean => {
+          try {
+            const { hostname } = new URL(u)
+            return (
+              hostname.includes('mega.nz') ||
+              hostname.includes('mega.co.nz') ||
+              hostname.includes('vidhidepro') ||
+              hostname.includes('vidhidefast') ||
+              hostname.includes('callistanise')
+            )
+          } catch {
+            return false
+          }
+        }
+        const downloadUrl = needsEmbedUrl(server.url) ? server.url : server.url_resolved
+
+        void enqueueVideo(malId, episode, provider, downloadUrl, server.resolution)
 
         // Step 5: Trigger HF Space webhook for immediate processing
         triggerHfSpaceWebhook(HF_SPACE_WEBHOOK_URL, {
           mal_id: malId,
           episode,
           provider,
-          video_url: server.url_resolved,
+          video_url: downloadUrl,
           resolution: server.resolution,
         })
       } catch {

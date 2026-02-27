@@ -1,5 +1,3 @@
-import axios from 'axios'
-
 import { Logger } from '../../utils/logger'
 
 /**
@@ -32,17 +30,33 @@ export async function resolveVidhidepro(embedUrl: string): Promise<string | null
   try {
     // ── Step 1: Fetch the embed page (follow redirects automatically) ─────────
     // vidhidepro → vidhidefast → callistanise
-    const resp = await axios.get<string>(embedUrl, {
+    // Redirect chain: vidhidepro → vidhidefast → callistanise
+    // Callistanise checks Referer = vidhidefast.com and is slow to respond (~30s).
+    // Use native fetch() instead of axios — it handles redirects natively without
+    // follow-redirects library overhead, and callistanise responds faster to it.
+    const nativeResp = await fetch(embedUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         Accept: 'text/html,application/xhtml+xml,application/xhtml+xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8',
-        Referer: 'https://vidhidepro.com/',
+        Referer: 'https://vidhidefast.com/',
       },
-      maxRedirects: 10,
-      timeout: 20000,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(45000),
     })
+
+    if (!nativeResp.ok) {
+      Logger.warning(`⚠️  vidhidepro: HTTP ${nativeResp.status} from ${nativeResp.url}`)
+      return null
+    }
+
+    // Wrap as axios-like resp for compatibility with rest of function
+    const resp = {
+      data: await nativeResp.text(),
+      status: nativeResp.status,
+      request: { res: { responseUrl: nativeResp.url } },
+    }
 
     const html: string = resp.data
     // Track the final URL after redirects (needed to absolutise relative paths)
@@ -178,15 +192,16 @@ function extractJsonString(obj: string, key: string): string | null {
  */
 async function resolveMasterM3u8(masterUrl: string): Promise<string | null> {
   try {
-    const resp = await axios.get<string>(masterUrl, {
+    const resp = await fetch(masterUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
-      timeout: 10000,
+      signal: AbortSignal.timeout(15000),
     })
 
-    const m3u8 = resp.data
+    if (!resp.ok) return null
+    const m3u8 = await resp.text()
     if (typeof m3u8 !== 'string') return null
 
     // Find the first non-comment, non-empty line after #EXT-X-STREAM-INF

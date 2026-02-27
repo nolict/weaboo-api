@@ -52,25 +52,116 @@ async function supabaseSelect(env, table, filters) {
 // ── Stream proxy helper ───────────────────────────────────────────────────────
 
 /**
+ * Detect if a URL is a HuggingFace dataset resolve URL.
+ * HF raw URLs redirect to LFS/CDN — we must follow redirects manually
+ * and use a browser-like UA, otherwise CF Workers gets a redirect loop or
+ * a 403 from HF's CDN.
+ */
+function isHuggingFaceUrl(url) {
+  try {
+    const { hostname } = new URL(url)
+    return hostname === 'huggingface.co' || hostname.endsWith('.huggingface.co')
+  } catch {
+    return false
+  }
+}
+
+/**
  * Proxy a video stream from a remote URL, forwarding Range headers so
  * the client can seek. Supports both HLS (.m3u8) and progressive MP4.
+ *
+ * For HuggingFace URLs: follow redirects manually with a browser UA so we
+ * land on the actual LFS/CDN URL, then proxy from there.
+ * For other URLs: proxy directly.
  */
 async function proxyStream(request, targetUrl) {
-  const headers = new Headers()
-
-  // Forward Range header for seekable video
   const range = request.headers.get('Range')
+
+  // HuggingFace dataset resolve URLs redirect to LFS CDN.
+  // CF Workers fetch() follows redirects automatically but HF requires a
+  // browser-like User-Agent AND the redirect destination (cdn-lfs.huggingface.co)
+  // needs proper Range header forwarding. We resolve the final URL first, then
+  // proxy from there directly to avoid double-hop issues.
+  let finalUrl = targetUrl
+  if (isHuggingFaceUrl(targetUrl)) {
+    try {
+      // Use HEAD to follow HF redirects and discover the final CDN URL without
+      // consuming any body bytes. HF dataset resolve URLs redirect to
+      // cdn-lfs-us-1.huggingface.co — we need that final URL for Range requests.
+      const headResp = await fetch(targetUrl, {
+        method: 'HEAD',
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          Accept: '*/*',
+        },
+        redirect: 'follow',
+      })
+
+      // After following redirects, headResp.url is the final CDN URL
+      if (headResp.url && headResp.url !== targetUrl) {
+        finalUrl = headResp.url
+      }
+
+      // Now do the real GET request to the final CDN URL, with Range if present
+      const getHeaders = new Headers()
+      getHeaders.set(
+        'User-Agent',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      )
+      if (range !== null) getHeaders.set('Range', range)
+
+      const cdnResp = await fetch(finalUrl, { headers: getHeaders })
+
+      const responseHeaders = new Headers()
+      responseHeaders.set('Content-Type', 'video/mp4')
+      const cl = cdnResp.headers.get('Content-Length')
+      if (cl !== null) responseHeaders.set('Content-Length', cl)
+      const cr = cdnResp.headers.get('Content-Range')
+      if (cr !== null) responseHeaders.set('Content-Range', cr)
+      const ar = cdnResp.headers.get('Accept-Ranges')
+      // HF CDN supports Range — always advertise this even if upstream didn't send it
+      responseHeaders.set('Accept-Ranges', ar ?? 'bytes')
+      responseHeaders.set('Content-Disposition', 'inline')
+      responseHeaders.set('Access-Control-Allow-Origin', '*')
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+      responseHeaders.set('Access-Control-Allow-Headers', 'Range')
+      responseHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
+
+      return new Response(cdnResp.body, { status: cdnResp.status, headers: responseHeaders })
+    } catch (err) {
+      return new Response(`Failed to resolve HuggingFace URL: ${err.message}`, { status: 502 })
+    }
+  }
+
+  // ── Non-HF URL: proxy directly ───────────────────────────────────────────
+  const headers = new Headers()
   if (range !== null) headers.set('Range', range)
+  headers.set(
+    'User-Agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  )
 
-  // Identify ourselves, don't pretend to be a browser to the upstream
-  headers.set('User-Agent', 'WeabooWorker/1.0')
-
-  const upstream = await fetch(targetUrl, { headers })
+  const upstream = await fetch(finalUrl, { headers })
 
   // Build response headers — expose to browser
   const responseHeaders = new Headers()
-  const contentType = upstream.headers.get('Content-Type')
-  if (contentType !== null) responseHeaders.set('Content-Type', contentType)
+
+  // Normalise Content-Type: some CDNs (e.g. Cloudflare R2 via Filedon) send
+  // 'application/octet-stream' or 'binary/octet-stream' which also triggers
+  // download. Force 'video/mp4' for any non-HLS binary response so the browser
+  // treats it as an inline video stream.
+  const contentType = upstream.headers.get('Content-Type') ?? ''
+  if (
+    contentType.includes('mpegurl') ||
+    contentType.includes('x-mpegurl') ||
+    finalUrl.includes('.m3u8')
+  ) {
+    responseHeaders.set('Content-Type', 'application/vnd.apple.mpegurl')
+  } else {
+    // For MP4 / octet-stream / anything else — force video/mp4 so browser streams inline
+    responseHeaders.set('Content-Type', 'video/mp4')
+  }
 
   const contentLength = upstream.headers.get('Content-Length')
   if (contentLength !== null) responseHeaders.set('Content-Length', contentLength)
@@ -80,6 +171,10 @@ async function proxyStream(request, targetUrl) {
 
   const acceptRanges = upstream.headers.get('Accept-Ranges')
   if (acceptRanges !== null) responseHeaders.set('Accept-Ranges', acceptRanges)
+
+  // Explicitly DO NOT forward Content-Disposition — CDNs like Filedon/R2 send
+  // 'attachment; filename=...' which forces browser download instead of streaming.
+  responseHeaders.set('Content-Disposition', 'inline')
 
   // CORS — allow any origin so video players on any domain can access
   responseHeaders.set('Access-Control-Allow-Origin', '*')
@@ -102,7 +197,12 @@ async function proxyStream(request, targetUrl) {
  */
 async function proxyM3u8(request, targetUrl, workerBase) {
   const upstream = await fetch(targetUrl, {
-    headers: { 'User-Agent': 'WeabooWorker/1.0' },
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    },
+    redirect: 'follow',
   })
 
   if (!upstream.ok) {
