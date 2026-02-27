@@ -61,13 +61,15 @@ export class StreamingController {
 
       Logger.debug(
         `🗺️  Mapping found: animasu=${mapping.slug_animasu ?? 'n/a'}, ` +
-          `samehadaku=${mapping.slug_samehadaku ?? 'n/a'}`
+          `samehadaku=${mapping.slug_samehadaku ?? 'n/a'}, ` +
+          `nontonanimeid=${mapping.slug_nontonanimeid ?? 'n/a'}`
       )
 
-      // ── Step 2: Scrape streaming links from both providers ─────────────────
+      // ── Step 2: Scrape streaming links from all providers ──────────────────
       const streamingData = await getStreamingLinks(
         mapping.slug_animasu,
         mapping.slug_samehadaku,
+        mapping.slug_nontonanimeid,
         episode,
         malId
       )
@@ -85,7 +87,11 @@ export class StreamingController {
   private successResponse(
     malId: number,
     episode: number,
-    data: { animasu: StreamingServer[] | null; samehadaku: StreamingServer[] | null }
+    data: {
+      animasu: StreamingServer[] | null
+      samehadaku: StreamingServer[] | null
+      nontonanimeid: StreamingServer[] | null
+    }
   ): Response {
     const body: StreamingResponse = {
       success: true,

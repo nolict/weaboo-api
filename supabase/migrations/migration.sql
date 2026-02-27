@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS anime_mappings (
   title_main       TEXT         NOT NULL,
   slug_samehadaku  VARCHAR(255),
   slug_animasu     VARCHAR(255),
+  slug_nontonanimeid VARCHAR(255),
 
   -- 64-character hex string representing 256-bit perceptual hash
   -- (blockhash-core produces a 256-bit hash stored as 64 hex chars)
@@ -31,8 +32,9 @@ CREATE TABLE IF NOT EXISTS anime_mappings (
 
 -- Indexes for fast slug lookups (both providers query direction)
 CREATE INDEX IF NOT EXISTS idx_anime_mappings_mal_id          ON anime_mappings (mal_id);
-CREATE INDEX IF NOT EXISTS idx_anime_mappings_slug_samehadaku ON anime_mappings (slug_samehadaku);
-CREATE INDEX IF NOT EXISTS idx_anime_mappings_slug_animasu    ON anime_mappings (slug_animasu);
+CREATE INDEX IF NOT EXISTS idx_anime_mappings_slug_samehadaku   ON anime_mappings (slug_samehadaku);
+CREATE INDEX IF NOT EXISTS idx_anime_mappings_slug_animasu      ON anime_mappings (slug_animasu);
+CREATE INDEX IF NOT EXISTS idx_anime_mappings_slug_nontonanimeid ON anime_mappings (slug_nontonanimeid);
 
 -- ============================================================
 -- FUNCTION: hamming_distance(text, text) → integer
@@ -216,8 +218,9 @@ $$;
 CREATE OR REPLACE FUNCTION upsert_anime_mapping(
   p_mal_id          INTEGER,
   p_title_main      TEXT,
-  p_slug_samehadaku VARCHAR(255) DEFAULT NULL,
-  p_slug_animasu    VARCHAR(255) DEFAULT NULL,
+  p_slug_samehadaku    VARCHAR(255) DEFAULT NULL,
+  p_slug_animasu       VARCHAR(255) DEFAULT NULL,
+  p_slug_nontonanimeid VARCHAR(255) DEFAULT NULL,
   p_phash_v1        VARCHAR(64)  DEFAULT NULL,
   p_release_year    INTEGER      DEFAULT NULL,
   p_total_episodes  INTEGER      DEFAULT NULL
@@ -229,17 +232,18 @@ DECLARE
   result anime_mappings;
 BEGIN
   INSERT INTO anime_mappings (
-    mal_id, title_main, slug_samehadaku, slug_animasu,
+    mal_id, title_main, slug_samehadaku, slug_animasu, slug_nontonanimeid,
     phash_v1, release_year, total_episodes, last_sync
   )
   VALUES (
-    p_mal_id, p_title_main, p_slug_samehadaku, p_slug_animasu,
+    p_mal_id, p_title_main, p_slug_samehadaku, p_slug_animasu, p_slug_nontonanimeid,
     p_phash_v1, p_release_year, p_total_episodes, NOW()
   )
   ON CONFLICT (mal_id) DO UPDATE SET
     title_main      = COALESCE(EXCLUDED.title_main,      anime_mappings.title_main),
-    slug_samehadaku = COALESCE(EXCLUDED.slug_samehadaku, anime_mappings.slug_samehadaku),
-    slug_animasu    = COALESCE(EXCLUDED.slug_animasu,    anime_mappings.slug_animasu),
+    slug_samehadaku    = COALESCE(EXCLUDED.slug_samehadaku,    anime_mappings.slug_samehadaku),
+    slug_animasu       = COALESCE(EXCLUDED.slug_animasu,       anime_mappings.slug_animasu),
+    slug_nontonanimeid = COALESCE(EXCLUDED.slug_nontonanimeid, anime_mappings.slug_nontonanimeid),
     phash_v1        = COALESCE(EXCLUDED.phash_v1,        anime_mappings.phash_v1),
     release_year    = COALESCE(EXCLUDED.release_year,    anime_mappings.release_year),
     total_episodes  = COALESCE(EXCLUDED.total_episodes,  anime_mappings.total_episodes),

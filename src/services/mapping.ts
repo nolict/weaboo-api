@@ -149,6 +149,81 @@ async function scrapeSamehadakuDetail(slug: string): Promise<AnimeDetailScrape |
   }
 }
 
+/**
+ * Scrape a NontonAnimeid anime detail page.
+ * URL pattern: https://s11.nontonanimeid.boats/anime/<slug>/
+ *
+ * Extracts: title (h1), poster image (og:image), release year (Aired: field),
+ * episode count (span.info-item containing "N Episodes").
+ */
+async function scrapeNontonAnimeidDetail(slug: string): Promise<AnimeDetailScrape | null> {
+  try {
+    const url = `${PROVIDERS.NONTONANIMEID.baseUrl}/anime/${slug}/`
+
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      },
+    })
+
+    if (!res.ok) {
+      Logger.warning(`⚠️  NontonAnimeid detail HTTP ${res.status} for slug "${slug}"`)
+      return null
+    }
+
+    const html = await res.text()
+    const $ = cheerio.load(html)
+
+    // Title: h1 contains "Nonton {Title} Sub Indo" — extract clean title from og:title
+    // og:title format: "{Title} Sub Indo Terbaru - Nonton Anime ID"
+    // Prefer title from h1.entry-title but strip "Nonton ... Sub Indo" prefix/suffix
+    const ogTitle = $('meta[property="og:title"]').attr('content') ?? ''
+    let title = ogTitle
+      .replace(/\s*Sub Indo.*$/i, '')
+      .replace(/\s*Terbaru.*$/i, '')
+      .trim()
+    if (title === '') {
+      const h1 = $('h1').first().text().trim()
+      title = h1
+        .replace(/^Nonton\s+/i, '')
+        .replace(/\s+Sub Indo$/i, '')
+        .trim()
+    }
+
+    // Cover: og:image — NontonAnimeid uses standard WordPress og:image
+    const coverUrl = $('meta[property="og:image"]').attr('content') ?? ''
+
+    // Year: "Aired: Jan 9, 2026 to ?" format in .details-list li
+    let year: number | null = null
+    $('.details-list li').each((_, el) => {
+      const text = $(el).text().trim()
+      if (/^Aired:/i.test(text)) {
+        const match = /(\d{4})/.exec(text)
+        if (match !== null) year = parseInt(match[1], 10)
+      }
+    })
+
+    // Episodes: "12 Episodes" in span.info-item
+    let totalEpisodes: number | null = null
+    $('span.info-item').each((_, el) => {
+      const text = $(el).text().trim()
+      const match = /^(\d+)\s+Episodes?$/i.exec(text)
+      if (match !== null) totalEpisodes = parseInt(match[1], 10)
+    })
+
+    if (title === '' || coverUrl === '') return null
+
+    return { title, coverUrl, year, totalEpisodes, slug, provider: PROVIDERS.NONTONANIMEID.name }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    Logger.warning(`⚠️  Failed to scrape NontonAnimeid detail (${slug}): ${msg}`)
+    return null
+  }
+}
+
 // ── Cross-provider slug discovery ─────────────────────────────────────────────
 
 /**
@@ -158,13 +233,20 @@ async function scrapeSamehadakuDetail(slug: string): Promise<AnimeDetailScrape |
  * A valid cover must be hosted on the provider's own domain or a known
  * CDN it uses (e.g. wp.com for WordPress-based sites).
  */
-function isCoverUrlValid(coverUrl: string, targetProvider: 'samehadaku' | 'animasu'): boolean {
+function isCoverUrlValid(
+  coverUrl: string,
+  targetProvider: 'samehadaku' | 'animasu' | 'nontonanimeid'
+): boolean {
   if (coverUrl === '') return false
   try {
     const { hostname } = new URL(coverUrl)
     if (targetProvider === 'animasu') {
       // Animasu uses WordPress — images served via i0.wp.com / i1.wp.com / i2.wp.com
       return hostname.includes('animasu') || hostname.endsWith('wp.com')
+    }
+    if (targetProvider === 'nontonanimeid') {
+      // NontonAnimeid uses WordPress CDN (i0.wp.com) or their own domain
+      return hostname.includes('nontonanimeid') || hostname.endsWith('wp.com')
     }
     // Samehadaku images hosted on their own domain or CDN
     return hostname.includes('samehadaku') || hostname.endsWith('wp.com')
@@ -183,7 +265,7 @@ function isCoverUrlValid(coverUrl: string, targetProvider: 'samehadaku' | 'anima
  */
 async function searchProviderForSlug(
   query: string,
-  targetProvider: 'samehadaku' | 'animasu',
+  targetProvider: 'samehadaku' | 'animasu' | 'nontonanimeid',
   trustSearchEngine: boolean = false
 ): Promise<
   Array<{
@@ -193,14 +275,34 @@ async function searchProviderForSlug(
     skipTitleFilter: boolean
   }>
 > {
-  const baseUrl =
-    targetProvider === 'animasu' ? PROVIDERS.ANIMASU.baseUrl : PROVIDERS.SAMEHADAKU.baseUrl
+  let baseUrl: string
+  if (targetProvider === 'animasu') {
+    baseUrl = PROVIDERS.ANIMASU.baseUrl
+  } else if (targetProvider === 'nontonanimeid') {
+    baseUrl = PROVIDERS.NONTONANIMEID.baseUrl
+  } else {
+    baseUrl = PROVIDERS.SAMEHADAKU.baseUrl
+  }
 
   const searchUrl = `${baseUrl}/?s=${encodeURIComponent(query)}`
   Logger.debug(`  🔎 Provider search: ${searchUrl}`)
 
   try {
-    const html = await fetchHTML(searchUrl)
+    let html: string
+    if (targetProvider === 'nontonanimeid') {
+      // NontonAnimeid uses native fetch (no Cloudflare block)
+      const res = await fetch(searchUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      html = await res.text()
+    } else {
+      html = await fetchHTML(searchUrl)
+    }
+
     const $ = cheerio.load(html)
 
     const results: Array<{
@@ -210,16 +312,48 @@ async function searchProviderForSlug(
       skipTitleFilter: boolean
     }> = []
 
-    // Animasu uses .bs card structure; Samehadaku uses .animpost on search pages.
-    // We handle both selectors and extract title/slug/cover from each.
-    const cardSelector = targetProvider === 'animasu' ? '.bs' : '.animpost'
+    // Animasu: .bs cards
+    // Samehadaku: .animpost on search pages
+    // NontonAnimeid: article.animeseries cards (slug under /anime/{slug}/)
+    let cardSelector: string
+    if (targetProvider === 'animasu') {
+      cardSelector = '.bs'
+    } else if (targetProvider === 'nontonanimeid') {
+      cardSelector = 'article.animeseries'
+    } else {
+      cardSelector = '.animpost'
+    }
 
     $(cardSelector).each((_, el) => {
       const $el = $(el)
+
+      let href = ''
+      let img = ''
+      let cardTitle = ''
+
+      if (targetProvider === 'nontonanimeid') {
+        // NontonAnimeid: a[href] → /anime/{slug}/, img[src], h3.title span
+        href = $el.find('a[href]').first().attr('href') ?? ''
+        img = $el.find('img').first().attr('src') ?? ''
+        cardTitle = $el.find('h3.title span').first().text().trim()
+        // Slug is in /anime/{slug}/ path
+        try {
+          const urlObj = new URL(href)
+          const parts = urlObj.pathname.split('/').filter(Boolean)
+          // path: ['anime', '{slug}']
+          const slug = parts[1] ?? ''
+          if (slug !== '' && isCoverUrlValid(img, 'nontonanimeid')) {
+            results.push({ slug, coverUrl: img, cardTitle, skipTitleFilter: false })
+          }
+        } catch {
+          // skip
+        }
+        return
+      }
+
       const $anchor = $el.find('a[title]').first()
-      const href = $anchor.attr('href') ?? $el.find('a').first().attr('href') ?? ''
-      const img =
-        $el.find('img').first().attr('src') ?? $el.find('img').first().attr('data-src') ?? ''
+      href = $anchor.attr('href') ?? $el.find('a').first().attr('href') ?? ''
+      img = $el.find('img').first().attr('src') ?? $el.find('img').first().attr('data-src') ?? ''
 
       // Card title:
       // - Animasu: prefer .tt (Japanese/original title), fallback to a[title]
@@ -227,7 +361,7 @@ async function searchProviderForSlug(
       const ttText = $el.find('.tt').first().text().trim()
       const h2Text = $el.find('h2').first().text().trim()
       const anchorTitle = $anchor.attr('title') ?? ''
-      const cardTitle = ttText !== '' ? ttText : anchorTitle !== '' ? anchorTitle : h2Text
+      cardTitle = ttText !== '' ? ttText : anchorTitle !== '' ? anchorTitle : h2Text
 
       if (href === '' || img === '') return
 
@@ -248,8 +382,6 @@ async function searchProviderForSlug(
 
     // If trustSearchEngine is set and we got a small, specific result set,
     // mark all candidates to skip the card-title pre-filter.
-    // Samehadaku search with a long romaji query is precise enough that even
-    // results with short/abbrev card titles (e.g. "Yuukawa") are correct matches.
     if (trustSearchEngine && results.length <= 3) {
       return results.map((r) => ({ ...r, skipTitleFilter: true }))
     }
@@ -283,10 +415,21 @@ async function searchProviderForSlug(
  */
 async function discoverOppositeSlug(
   jikanAnime: JikanAnime,
-  sourceProvider: 'samehadaku' | 'animasu',
-  sourcePHash: string | null
+  sourceProvider: 'samehadaku' | 'animasu' | 'nontonanimeid',
+  sourcePHash: string | null,
+  explicitTarget?: 'samehadaku' | 'animasu' | 'nontonanimeid'
 ): Promise<{ slug: string; phash: string | null } | null> {
-  const targetProvider = sourceProvider === 'samehadaku' ? 'animasu' : 'samehadaku'
+  // If explicitTarget is given, use it. Otherwise derive the opposite.
+  let targetProvider: 'samehadaku' | 'animasu' | 'nontonanimeid'
+  if (explicitTarget !== undefined) {
+    targetProvider = explicitTarget
+  } else if (sourceProvider === 'samehadaku') {
+    targetProvider = 'animasu'
+  } else if (sourceProvider === 'animasu') {
+    targetProvider = 'samehadaku'
+  } else {
+    targetProvider = 'samehadaku' // nontonanimeid default: search samehadaku
+  }
 
   // Build search query list — ordered from most specific to most lenient:
   // 1. Full title as-is   (e.g. "Jigokuraku 2nd Season", "Hell's Paradise Season 2")
@@ -411,8 +554,14 @@ async function discoverOppositeSlug(
       // pHash didn't match conclusively. Scrape the full detail page and
       // run a THREE-factor check: title similarity + year + episode count.
       // All three must pass to avoid false positives like "yuukawa" ≠ "SI-VIS".
-      const scraper = targetProvider === 'animasu' ? scrapeAnimasuDetail : scrapeSamehadakuDetail
-      const detail = await scraper(candidate.slug)
+      let detail: AnimeDetailScrape | null
+      if (targetProvider === 'animasu') {
+        detail = await scrapeAnimasuDetail(candidate.slug)
+      } else if (targetProvider === 'nontonanimeid') {
+        detail = await scrapeNontonAnimeidDetail(candidate.slug)
+      } else {
+        detail = await scrapeSamehadakuDetail(candidate.slug)
+      }
 
       if (detail !== null && isCoverUrlValid(detail.coverUrl, targetProvider)) {
         // Gate 1: Title must be similar to MAL title (> threshold)
@@ -675,13 +824,19 @@ async function discoverOppositeSlug(
  */
 async function runDiscovery(
   slug: string,
-  provider: 'samehadaku' | 'animasu'
+  provider: 'samehadaku' | 'animasu' | 'nontonanimeid'
 ): Promise<AnimeMapping | null> {
   Logger.info(`🚀 Starting enrichment for ${provider}/${slug}`)
 
   // ── Step 1: Scrape detail page ────────────────────────────────────────────
-  const scraper = provider === 'samehadaku' ? scrapeSamehadakuDetail : scrapeAnimasuDetail
-  const detail = await scraper(slug)
+  let detail: AnimeDetailScrape | null
+  if (provider === 'samehadaku') {
+    detail = await scrapeSamehadakuDetail(slug)
+  } else if (provider === 'nontonanimeid') {
+    detail = await scrapeNontonAnimeidDetail(slug)
+  } else {
+    detail = await scrapeAnimasuDetail(slug)
+  }
 
   if (detail === null) {
     Logger.warning(`⚠️  Could not scrape detail page for ${provider}/${slug}`)
@@ -780,20 +935,43 @@ async function runDiscovery(
   }
 
   // ── Step 6: Cross-provider slug discovery ─────────────────────────────────
-  const opposite = await discoverOppositeSlug(matchResult.jikanAnime, provider, pHash)
+  // For nontonanimeid: discover both animasu + samehadaku
+  // For animasu/samehadaku: discover the other two providers
+  let slugSamehadaku: string | null = provider === 'samehadaku' ? slug : null
+  let slugAnimasu: string | null = provider === 'animasu' ? slug : null
+  let slugNontonanimeid: string | null = provider === 'nontonanimeid' ? slug : null
+  let finalPHash: string | null = pHash
 
-  // ── Step 7: Build triangle mapping and upsert ─────────────────────────────
-  const slugSamehadaku = provider === 'samehadaku' ? slug : (opposite?.slug ?? null)
-  const slugAnimasu = provider === 'animasu' ? slug : (opposite?.slug ?? null)
+  // Discover missing provider slugs
+  const providersToDo: Array<'samehadaku' | 'animasu' | 'nontonanimeid'> = []
+  if (slugSamehadaku === null) providersToDo.push('samehadaku')
+  if (slugAnimasu === null) providersToDo.push('animasu')
+  if (slugNontonanimeid === null) providersToDo.push('nontonanimeid')
 
-  // Use source pHash or the opposite provider's hash (whichever we have)
-  const finalPHash = pHash ?? opposite?.phash ?? null
+  for (const targetProv of providersToDo) {
+    // discoverOppositeSlug searches <targetProv> when sourceProvider != targetProv
+    // We use the current source provider for the first discovery, then switch
+    const result = await discoverOppositeSlug(
+      matchResult.jikanAnime,
+      provider,
+      finalPHash,
+      targetProv
+    )
+    if (result !== null) {
+      if (targetProv === 'samehadaku') slugSamehadaku = result.slug
+      else if (targetProv === 'animasu') slugAnimasu = result.slug
+      else slugNontonanimeid = result.slug
+      finalPHash = finalPHash ?? result.phash
+    }
+  }
 
+  // ── Step 7: Build mapping and upsert ──────────────────────────────────────
   const mapping = await upsertMapping({
     malId: matchResult.malId,
     titleMain: matchResult.titleMain ?? matchResult.jikanAnime.title,
     slugSamehadaku,
     slugAnimasu,
+    slugNontonanimeid,
     phashV1: finalPHash,
     releaseYear: matchResult.jikanAnime.year ?? detail.year,
     totalEpisodes: matchResult.jikanAnime.episodes ?? detail.totalEpisodes,
@@ -801,7 +979,9 @@ async function runDiscovery(
 
   Logger.success(
     `💾 Mapping saved: mal_id=${mapping.mal_id} | ` +
-      `samehadaku=${mapping.slug_samehadaku ?? '-'} | animasu=${mapping.slug_animasu ?? '-'}`
+      `samehadaku=${mapping.slug_samehadaku ?? '-'} | ` +
+      `animasu=${mapping.slug_animasu ?? '-'} | ` +
+      `nontonanimeid=${mapping.slug_nontonanimeid ?? '-'}`
   )
 
   return mapping
@@ -852,17 +1032,15 @@ async function runDiscoveryByMalId(malId: number): Promise<AnimeMapping | null> 
     images: malAnime.images,
   }
 
-  // ── Step 3: Discover slugs on both providers ──────────────────────────────
-  // We search Samehadaku first (more reliable full-title search per spec),
-  // then use the Samehadaku pHash to assist Animasu discovery.
+  // ── Step 3: Discover slugs on all providers ───────────────────────────────
+  // Search Samehadaku first, use its pHash to assist other providers.
   Logger.info(`🔎 Searching Samehadaku for mal_id=${malId} ("${malAnime.title}")`)
-  const samehadakuResult = await discoverOppositeSlug(jikanAnime, 'animasu', null)
-  // discoverOppositeSlug(source='animasu') → searches samehadaku
+  const samehadakuResult = await discoverOppositeSlug(jikanAnime, 'animasu', null, 'samehadaku')
 
   const slugSamehadaku: string | null = samehadakuResult?.slug ?? null
   let sourcePHash: string | null = samehadakuResult?.phash ?? null
 
-  // If we got a Samehadaku slug, generate its pHash to assist Animasu discovery
+  // If we got a Samehadaku slug, generate its pHash to assist other providers
   if (slugSamehadaku !== null && sourcePHash === null) {
     const detail = await scrapeSamehadakuDetail(slugSamehadaku)
     if (detail !== null) {
@@ -871,13 +1049,23 @@ async function runDiscoveryByMalId(malId: number): Promise<AnimeMapping | null> 
   }
 
   Logger.info(`🔎 Searching Animasu for mal_id=${malId} ("${malAnime.title}")`)
-  const animasuResult = await discoverOppositeSlug(jikanAnime, 'samehadaku', sourcePHash)
-  // discoverOppositeSlug(source='samehadaku') → searches animasu
+  const animasuResult = await discoverOppositeSlug(jikanAnime, 'samehadaku', sourcePHash, 'animasu')
 
   const slugAnimasu: string | null = animasuResult?.slug ?? null
-  const finalPHash = sourcePHash ?? animasuResult?.phash ?? null
+  const phashAfterAnimasu = sourcePHash ?? animasuResult?.phash ?? null
 
-  if (slugSamehadaku === null && slugAnimasu === null) {
+  Logger.info(`🔎 Searching NontonAnimeid for mal_id=${malId} ("${malAnime.title}")`)
+  const naidResult = await discoverOppositeSlug(
+    jikanAnime,
+    'samehadaku',
+    phashAfterAnimasu,
+    'nontonanimeid'
+  )
+
+  const slugNontonanimeid: string | null = naidResult?.slug ?? null
+  const finalPHash = phashAfterAnimasu ?? naidResult?.phash ?? null
+
+  if (slugSamehadaku === null && slugAnimasu === null && slugNontonanimeid === null) {
     Logger.warning(`⚠️  Could not find any provider slug for mal_id=${malId}`)
     // Still upsert a partial mapping so MAL metadata is cached
   }
@@ -888,6 +1076,7 @@ async function runDiscoveryByMalId(malId: number): Promise<AnimeMapping | null> 
     titleMain: malAnime.title,
     slugSamehadaku,
     slugAnimasu,
+    slugNontonanimeid,
     phashV1: finalPHash,
     releaseYear: malAnime.year,
     totalEpisodes: malAnime.episodes,
@@ -895,7 +1084,9 @@ async function runDiscoveryByMalId(malId: number): Promise<AnimeMapping | null> 
 
   Logger.success(
     `💾 Mapping saved (by MAL ID): mal_id=${mapping.mal_id} | ` +
-      `samehadaku=${mapping.slug_samehadaku ?? '-'} | animasu=${mapping.slug_animasu ?? '-'}`
+      `samehadaku=${mapping.slug_samehadaku ?? '-'} | ` +
+      `animasu=${mapping.slug_animasu ?? '-'} | ` +
+      `nontonanimeid=${mapping.slug_nontonanimeid ?? '-'}`
   )
 
   return mapping
@@ -931,7 +1122,7 @@ export async function resolveMappingByMalId(malId: number): Promise<AnimeMapping
  */
 export async function resolveMapping(
   slug: string,
-  provider: 'samehadaku' | 'animasu'
+  provider: 'samehadaku' | 'animasu' | 'nontonanimeid'
 ): Promise<AnimeMapping | null> {
   const lockKey = `${provider}:${slug}`
 

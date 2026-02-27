@@ -9,6 +9,11 @@ export const PROVIDERS = {
     url: 'https://v1.animasu.app/anime-sedang-tayang-terbaru/',
     baseUrl: 'https://v1.animasu.app',
   },
+  NONTONANIMEID: {
+    name: 'nontonanimeid',
+    url: 'https://s11.nontonanimeid.boats/',
+    baseUrl: 'https://s11.nontonanimeid.boats',
+  },
 } as const
 
 // ── MAL Genre list (from Jikan /genres/anime) ───────────────────────────────

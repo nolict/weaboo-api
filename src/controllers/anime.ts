@@ -11,7 +11,7 @@ import type { AnimeDetailResponse, MappingApiResponse } from '../types/anime'
 import { Logger } from '../utils/logger'
 
 // ── Allowed provider values ───────────────────────────────────────────────────
-const VALID_PROVIDERS = ['samehadaku', 'animasu'] as const
+const VALID_PROVIDERS = ['samehadaku', 'animasu', 'nontonanimeid'] as const
 type ProviderName = (typeof VALID_PROVIDERS)[number]
 
 function isValidProvider(value: string): value is ProviderName {
@@ -39,7 +39,10 @@ export class AnimeController {
   async getAnime(slug: string, rawProvider: string | null): Promise<Response> {
     // ── Validate provider param ───────────────────────────────────────────────
     if (rawProvider === null || rawProvider === '') {
-      return this.errorResponse(400, 'Missing query parameter: provider=[samehadaku|animasu]')
+      return this.errorResponse(
+        400,
+        'Missing query parameter: provider=[samehadaku|animasu|nontonanimeid]'
+      )
     }
 
     if (!isValidProvider(rawProvider)) {
@@ -108,9 +111,14 @@ export class AnimeController {
       // ── Step 3: Episode lists (20-minute TTL cache, both providers concurrent) ─
       Logger.debug(
         `📺 Fetching episodes — animasu: ${mapping.slug_animasu ?? 'n/a'}, ` +
-          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}`
+          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}, ` +
+          `nontonanimeid: ${mapping.slug_nontonanimeid ?? 'n/a'}`
       )
-      const episodes = await getEpisodeList(mapping.slug_animasu, mapping.slug_samehadaku)
+      const episodes = await getEpisodeList(
+        mapping.slug_animasu,
+        mapping.slug_samehadaku,
+        mapping.slug_nontonanimeid
+      )
 
       // ── Step 4: Compose response ──────────────────────────────────────────────
       const detail: AnimeDetailResponse = {
@@ -191,9 +199,14 @@ export class AnimeController {
       // ── Step 3: Episode lists ─────────────────────────────────────────────────
       Logger.debug(
         `📺 Fetching episodes — animasu: ${mapping.slug_animasu ?? 'n/a'}, ` +
-          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}`
+          `samehadaku: ${mapping.slug_samehadaku ?? 'n/a'}, ` +
+          `nontonanimeid: ${mapping.slug_nontonanimeid ?? 'n/a'}`
       )
-      const episodes = await getEpisodeList(mapping.slug_animasu, mapping.slug_samehadaku)
+      const episodes = await getEpisodeList(
+        mapping.slug_animasu,
+        mapping.slug_samehadaku,
+        mapping.slug_nontonanimeid
+      )
 
       // ── Step 4: Compose response ──────────────────────────────────────────────
       const detail: AnimeDetailResponse = { mapping, mal: malMeta, episodes }

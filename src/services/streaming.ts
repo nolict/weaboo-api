@@ -17,6 +17,7 @@ interface StreamingCacheEntry {
   // Raw scraped servers — cached 20 min, HF store always checked fresh per-request
   animasu: StreamingServer[] | null
   samehadaku: StreamingServer[] | null
+  nontonanimeid: StreamingServer[] | null
   expiresAt: number
 }
 
@@ -176,6 +177,210 @@ async function scrapeAnimasuStreaming(
     Logger.warning(`⚠️  Animasu streaming scrape failed: ${msg}`)
     return null
   }
+}
+
+// ── NontonAnimeid scraper ─────────────────────────────────────────────────────
+
+/**
+ * NontonAnimeid player option from the episode page.
+ * DOM: ul.tabs1.player > li[data-post][data-type][data-nume] > span (label)
+ */
+interface NaidPlayerOption {
+  post: string
+  type: string
+  nume: string
+  label: string
+}
+
+interface NaidPageData {
+  options: NaidPlayerOption[]
+  episodeUrl: string
+  nonce: string
+}
+
+/**
+ * fetchNaidPageData — Fetches the NontonAnimeid episode page and extracts:
+ * - player options (data-post, data-type, data-nume, label)
+ * - nonce from the base64-encoded inline script `var kotakajax = {...}`
+ */
+async function fetchNaidPageData(slug: string, episode: number): Promise<NaidPageData | null> {
+  // First try to get real URL from episode cache (correct slug)
+  const realUrl = await getEpisodeUrl(slug, PROVIDERS.NONTONANIMEID.name, episode)
+  const episodeUrl = realUrl ?? `${PROVIDERS.NONTONANIMEID.baseUrl}/${slug}-episode-${episode}/`
+
+  if (realUrl !== null) {
+    Logger.debug(`📡 Fetching NontonAnimeid episode (URL from episode list): ${episodeUrl}`)
+  } else {
+    Logger.debug(`📡 Fetching NontonAnimeid episode (constructed URL): ${episodeUrl}`)
+  }
+
+  try {
+    const res = await fetch(episodeUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    })
+
+    if (!res.ok) {
+      Logger.warning(`⚠️  NontonAnimeid episode page returned ${res.status}: ${episodeUrl}`)
+      return null
+    }
+
+    const html = await res.text()
+    const $ = cheerio.load(html)
+
+    // Extract nonce from inline base64-encoded script:
+    // <script id="ajax_video-js-extra" src="data:text/javascript;base64,...">
+    // Decoded content: var kotakajax={"url":"...","nonce":"XXXX","..."}
+    const b64Match = html.match(
+      /ajax_video-js-extra"[^>]*src="data:text\/javascript;base64,([^"]+)"/
+    )
+    let nonce = ''
+    if (b64Match !== null) {
+      try {
+        const decoded = Buffer.from(b64Match[1], 'base64').toString('utf8')
+        const nonceMatch = /"nonce"\s*:\s*"([^"]+)"/.exec(decoded)
+        nonce = nonceMatch?.[1] ?? ''
+      } catch {
+        // nonce stays empty
+      }
+    }
+
+    if (nonce === '') {
+      Logger.warning(`⚠️  NontonAnimeid: could not extract nonce from ${episodeUrl}`)
+      return null
+    }
+
+    // Parse player options: ul.tabs1.player > li[data-post][data-type][data-nume]
+    const options: NaidPlayerOption[] = []
+    $('ul.tabs1.player li[data-post][data-type][data-nume]').each((_i, el) => {
+      const post = $(el).attr('data-post') ?? ''
+      const type = $(el).attr('data-type') ?? ''
+      const nume = $(el).attr('data-nume') ?? ''
+      const label = $(el).find('span').first().text().trim()
+      if (post !== '' && type !== '' && nume !== '') {
+        options.push({ post, type, nume, label })
+      }
+    })
+
+    Logger.debug(`  NontonAnimeid: options=${options.length}, nonce=${nonce}`)
+    return { options, episodeUrl, nonce }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    Logger.warning(`⚠️  NontonAnimeid episode page fetch failed: ${msg}`)
+    return null
+  }
+}
+
+/**
+ * fetchNaidEmbedUrl — POSTs to NontonAnimeid's WordPress AJAX endpoint.
+ *
+ * Key findings:
+ * - action = 'player_ajax'
+ * - Requires nonce (from kotakajax.nonce in inline base64 script)
+ * - Requires Origin header (server checks it)
+ * - Response is raw HTML containing <iframe src="...">
+ */
+async function fetchNaidEmbedUrl(
+  option: NaidPlayerOption,
+  episodeUrl: string,
+  nonce: string
+): Promise<string | null> {
+  const ajaxUrl = `${PROVIDERS.NONTONANIMEID.baseUrl}/wp-admin/admin-ajax.php`
+
+  const form = new FormData()
+  form.append('action', 'player_ajax')
+  form.append('post', option.post)
+  form.append('nume', option.nume)
+  form.append('type', option.type)
+  form.append('nonce', nonce)
+
+  try {
+    const res = await fetch(ajaxUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Origin: PROVIDERS.NONTONANIMEID.baseUrl,
+        Referer: episodeUrl,
+      },
+      body: form,
+    })
+
+    if (!res.ok) return null
+
+    const raw = await res.text()
+
+    // Extract src from iframe in response HTML
+    const srcMatch = /src=["']([^"']+)["']/.exec(raw)
+    if (srcMatch !== null) return srcMatch[1].trim()
+
+    // Fallback: plain URL string
+    if (raw.startsWith('http')) return raw.trim()
+
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * scrapeNontonAnimeidStreaming — Fetches all streaming servers for a NontonAnimeid episode.
+ *
+ * Flow:
+ *  1. Fetch episode page → extract player options + nonce
+ *  2. For each option, POST to AJAX endpoint → get embed URL
+ *  3. Resolve embed URLs → direct CDN URLs
+ */
+async function scrapeNontonAnimeidStreaming(
+  slug: string,
+  episode: number
+): Promise<StreamingServer[] | null> {
+  const pageData = await fetchNaidPageData(slug, episode)
+  if (pageData === null || pageData.options.length === 0) return null
+
+  const { options, episodeUrl, nonce } = pageData
+
+  // Fetch embed URLs concurrently
+  const results = await Promise.allSettled(
+    options.map(async (opt) => {
+      const embedUrl = await fetchNaidEmbedUrl(opt, episodeUrl, nonce)
+      return { opt, embedUrl }
+    })
+  )
+
+  const servers: StreamingServer[] = []
+
+  for (const result of results) {
+    if (result.status !== 'fulfilled') continue
+    const { opt, embedUrl } = result.value
+    if (embedUrl === null || embedUrl.length === 0) continue
+
+    const resolution = extractResolution(opt.label)
+    // Label format: "S-Lokal-c", "S-Kotakvideo" — derive server name from URL
+    const serverName = serverNameFromUrl(embedUrl)
+    const providerLabel = resolution !== null ? `${serverName} ${resolution}` : serverName
+
+    servers.push({
+      provider: providerLabel,
+      url: embedUrl,
+      url_resolved: null,
+      resolution,
+      stream: null,
+    })
+  }
+
+  // ── Resolve embed URLs concurrently ──────────────────────────────────────────
+  await Promise.all(
+    servers.map(async (server) => {
+      server.url_resolved = await resolveEmbedUrl(server.url)
+    })
+  )
+
+  Logger.debug(`  ✅ NontonAnimeid: found ${servers.length} streaming servers`)
+  return servers.length > 0 ? servers : null
 }
 
 // ── Samehadaku scraper ────────────────────────────────────────────────────────
@@ -446,7 +651,7 @@ async function enrichWithStreamUrls(
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
- * getStreamingLinks — Fetches streaming embed links from both providers concurrently,
+ * getStreamingLinks — Fetches streaming embed links from all providers concurrently,
  * enriches each server with a `stream` URL (Cloudflare Workers proxy), and
  * fires background jobs to archive videos to HuggingFace.
  *
@@ -456,49 +661,59 @@ async function enrichWithStreamUrls(
  *               the cache entry is promoted to permanent (expiresAt = 0).
  *               url_resolved in cached response will already point to HF URLs.
  *
- * @param slugAnimasu    - Animasu slug from the mapping (null if not available)
- * @param slugSamehadaku - Samehadaku slug from the mapping (null if not available)
- * @param episode        - Episode number to fetch
- * @param malId          - MAL ID used for queue/store lookup and CF Workers URL
+ * @param slugAnimasu       - Animasu slug from the mapping (null if not available)
+ * @param slugSamehadaku    - Samehadaku slug from the mapping (null if not available)
+ * @param slugNontonanimeid - NontonAnimeid slug from the mapping (null if not available)
+ * @param episode           - Episode number to fetch
+ * @param malId             - MAL ID used for queue/store lookup and CF Workers URL
  */
 export async function getStreamingLinks(
   slugAnimasu: string | null,
   slugSamehadaku: string | null,
+  slugNontonanimeid: string | null,
   episode: number,
   malId: number
-): Promise<{ animasu: StreamingServer[] | null; samehadaku: StreamingServer[] | null }> {
+): Promise<{
+  animasu: StreamingServer[] | null
+  samehadaku: StreamingServer[] | null
+  nontonanimeid: StreamingServer[] | null
+}> {
   const cacheKey = `${malId}:${episode}`
   const now = Date.now()
 
   // ── Cache hit check (scrape results only) ──────────────────────────────────
-  // HF store is always checked fresh on every request via enrichWithStreamUrls.
-  // This means url_resolved updates automatically once video_store has HF URL —
-  // no cache invalidation needed when HF upload completes.
   const cached = streamingCache.get(cacheKey)
   let animasuResult: StreamingServer[] | null
   let samehadakuResult: StreamingServer[] | null
+  let nontonanimeidResult: StreamingServer[] | null
 
   if (cached !== undefined && cached.expiresAt > now) {
     Logger.debug(`  ✅ Scrape cache hit (20min): ${cacheKey}`)
     animasuResult = cached.animasu
     samehadakuResult = cached.samehadaku
+    nontonanimeidResult = cached.nontonanimeid
   } else {
-    // Cache miss or expired — re-scrape both providers
+    // Cache miss or expired — re-scrape all providers
     if (cached !== undefined) streamingCache.delete(cacheKey)
 
-    const [a, s] = await Promise.all([
+    const [a, s, n] = await Promise.all([
       slugAnimasu !== null ? scrapeAnimasuStreaming(slugAnimasu, episode) : Promise.resolve(null),
       slugSamehadaku !== null
         ? scrapeSamehadakuStreaming(slugSamehadaku, episode)
         : Promise.resolve(null),
+      slugNontonanimeid !== null
+        ? scrapeNontonAnimeidStreaming(slugNontonanimeid, episode)
+        : Promise.resolve(null),
     ])
     animasuResult = a
     samehadakuResult = s
+    nontonanimeidResult = n
 
     // Cache raw scrape results for 20 minutes
     streamingCache.set(cacheKey, {
       animasu: animasuResult,
       samehadaku: samehadakuResult,
+      nontonanimeid: nontonanimeidResult,
       expiresAt: now + EPISODE_CACHE_TTL_MS,
     })
     Logger.debug(`  💾 Scrape cached (20min): ${cacheKey}`)
@@ -506,7 +721,6 @@ export async function getStreamingLinks(
 
   // ── Always check HF store fresh + enrich stream URLs ─────────────────────
   // Runs on every request (cache hit or miss). Supabase query ~20ms.
-  // url_resolved updates to HF URL automatically once video_store has the entry.
   await Promise.all([
     animasuResult !== null
       ? enrichWithStreamUrls(animasuResult, malId, episode, 'animasu')
@@ -514,7 +728,14 @@ export async function getStreamingLinks(
     samehadakuResult !== null
       ? enrichWithStreamUrls(samehadakuResult, malId, episode, 'samehadaku')
       : Promise.resolve(true),
+    nontonanimeidResult !== null
+      ? enrichWithStreamUrls(nontonanimeidResult, malId, episode, 'nontonanimeid')
+      : Promise.resolve(true),
   ])
 
-  return { animasu: animasuResult, samehadaku: samehadakuResult }
+  return {
+    animasu: animasuResult,
+    samehadaku: samehadakuResult,
+    nontonanimeid: nontonanimeidResult,
+  }
 }

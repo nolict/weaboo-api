@@ -111,6 +111,7 @@ export interface ProviderEpisodeList {
 export interface EpisodeList {
   animasu: EpisodeEntry[] | null
   samehadaku: EpisodeEntry[] | null
+  nontonanimeid: EpisodeEntry[] | null
 }
 
 // ── Supabase / Database mapping record ───────────────────────────────────────
@@ -121,6 +122,7 @@ export interface AnimeMapping {
   title_main: string
   slug_samehadaku: string | null
   slug_animasu: string | null
+  slug_nontonanimeid: string | null
   phash_v1: PHash | null
   release_year: number | null
   total_episodes: number | null
@@ -223,6 +225,7 @@ export interface VideoStoreEntry {
 export interface StreamingList {
   animasu: StreamingServer[] | null
   samehadaku: StreamingServer[] | null
+  nontonanimeid: StreamingServer[] | null
 }
 
 export interface StreamingResponse {

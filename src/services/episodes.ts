@@ -141,27 +141,83 @@ function scrapeSamehadakuEpisodes($: cheerio.CheerioAPI): EpisodeEntry[] {
 }
 
 /**
+ * scrapeNontonAnimeidEpisodes — NontonAnimeid detail page episode list.
+ *
+ * Structure: .episode-list-items > a.episode-item
+ *   - href → full watch URL  (e.g. https://s11.nontonanimeid.boats/{slug}-episode-{N}/)
+ *   - .ep-title text → episode label (e.g. "Episode 9")
+ *
+ * Detail page URL format: /anime/{slug}/
+ */
+function scrapeNontonAnimeidEpisodes($: cheerio.CheerioAPI): EpisodeEntry[] {
+  const entries: EpisodeEntry[] = []
+
+  $('.episode-list-items a.episode-item').each((_i, el) => {
+    const $el = $(el)
+    const href = $el.attr('href') ?? ''
+    const rawLabel = $el.find('.ep-title').text().trim()
+    if (href === '' || rawLabel === '') return
+
+    const parsed = parseEpisodeLabel(rawLabel)
+    if (parsed === null) {
+      Logger.debug(`  ⚠️  Could not parse NontonAnimeid episode label: "${rawLabel}" — skipping`)
+      return
+    }
+
+    entries.push({ label: rawLabel, episodeStart: parsed.start, episodeEnd: parsed.end, url: href })
+  })
+
+  return entries
+}
+
+/**
  * scrapeEpisodeList — Fetches the anime detail page and extracts episode entries
  * using the provider-specific DOM structure.
  *
- * - Animasu:    ul#daftarepisode > li > span.lchx > a
- * - Samehadaku: div.lstepsiode.listeps > ul > li > div.epsleft > span.lchx > a
+ * - Animasu:       ul#daftarepisode > li > span.lchx > a
+ * - Samehadaku:    div.lstepsiode.listeps > ul > li > div.epsleft > span.lchx > a
+ * - NontonAnimeid: .episode-list-items a.episode-item > .ep-title
  *
  * Episodes are returned in ascending order (oldest first).
  */
 async function scrapeEpisodeList(slug: string, provider: string): Promise<EpisodeEntry[]> {
-  const baseUrl =
-    provider === PROVIDERS.ANIMASU.name ? PROVIDERS.ANIMASU.baseUrl : PROVIDERS.SAMEHADAKU.baseUrl
+  let detailUrl: string
 
-  const detailUrl = `${baseUrl}/anime/${slug}/`
+  if (provider === PROVIDERS.ANIMASU.name) {
+    detailUrl = `${PROVIDERS.ANIMASU.baseUrl}/anime/${slug}/`
+  } else if (provider === PROVIDERS.NONTONANIMEID.name) {
+    detailUrl = `${PROVIDERS.NONTONANIMEID.baseUrl}/anime/${slug}/`
+  } else {
+    detailUrl = `${PROVIDERS.SAMEHADAKU.baseUrl}/anime/${slug}/`
+  }
 
   Logger.debug(`📺 Scraping episodes: ${provider}/${slug}`)
 
-  const html = await fetchHTML(detailUrl)
+  // NontonAnimeid uses native fetch (no Cloudflare issues)
+  let html: string
+  if (provider === PROVIDERS.NONTONANIMEID.name) {
+    const res = await fetch(detailUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${detailUrl}`)
+    html = await res.text()
+  } else {
+    html = await fetchHTML(detailUrl)
+  }
+
   const $ = cheerio.load(html)
 
-  const entries =
-    provider === PROVIDERS.ANIMASU.name ? scrapeAnimasuEpisodes($) : scrapeSamehadakuEpisodes($)
+  let entries: EpisodeEntry[]
+  if (provider === PROVIDERS.ANIMASU.name) {
+    entries = scrapeAnimasuEpisodes($)
+  } else if (provider === PROVIDERS.NONTONANIMEID.name) {
+    entries = scrapeNontonAnimeidEpisodes($)
+  } else {
+    entries = scrapeSamehadakuEpisodes($)
+  }
 
   // Providers list newest-first; reverse to ascending (ep 1, 2, 3 ... N)
   entries.reverse()
@@ -215,7 +271,7 @@ async function getEpisodesForProvider(
 }
 
 /**
- * getEpisodeList — Fetches episode lists from both providers concurrently.
+ * getEpisodeList — Fetches episode lists from all providers concurrently.
  *
  * Accepts the slugs from an AnimeMapping. Each provider is fetched
  * independently — failure in one does not affect the other.
@@ -224,16 +280,19 @@ async function getEpisodesForProvider(
  */
 export async function getEpisodeList(
   slugAnimasu: string | null,
-  slugSamehadaku: string | null
+  slugSamehadaku: string | null,
+  slugNontonanimeid?: string | null
 ): Promise<EpisodeList> {
-  const [animasuEpisodes, samehadakuEpisodes] = await Promise.all([
+  const [animasuEpisodes, samehadakuEpisodes, nontonanimeidEpisodes] = await Promise.all([
     getEpisodesForProvider(slugAnimasu, PROVIDERS.ANIMASU.name),
     getEpisodesForProvider(slugSamehadaku, PROVIDERS.SAMEHADAKU.name),
+    getEpisodesForProvider(slugNontonanimeid ?? null, PROVIDERS.NONTONANIMEID.name),
   ])
 
   return {
     animasu: animasuEpisodes,
     samehadaku: samehadakuEpisodes,
+    nontonanimeid: nontonanimeidEpisodes,
   }
 }
 

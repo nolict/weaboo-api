@@ -1,11 +1,16 @@
 import { AnimasuProvider } from '../providers/animasu'
+import { NontonAnimeidProvider } from '../providers/nontonanimeid'
 import { SamehadakuProvider } from '../providers/samehadaku'
 import type { NormalizedAnime, ProviderResponse } from '../types/anime'
 import { Logger } from '../utils/logger'
 import { AnimeNormalizer } from '../utils/normalizer'
 
 export class AnimeAggregator {
-  private readonly providers = [new AnimasuProvider(), new SamehadakuProvider()]
+  private readonly providers = [
+    new AnimasuProvider(),
+    new SamehadakuProvider(),
+    new NontonAnimeidProvider(),
+  ]
 
   async aggregateHome(): Promise<NormalizedAnime[]> {
     Logger.info('🚀 Starting anime aggregation from all providers')

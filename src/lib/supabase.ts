@@ -31,9 +31,14 @@ const MAL_TABLE = 'mal_metadata'
  */
 export async function findMappingBySlug(
   slug: string,
-  provider: 'samehadaku' | 'animasu'
+  provider: 'samehadaku' | 'animasu' | 'nontonanimeid'
 ): Promise<AnimeMapping | null> {
-  const column = provider === 'samehadaku' ? 'slug_samehadaku' : 'slug_animasu'
+  const column =
+    provider === 'samehadaku'
+      ? 'slug_samehadaku'
+      : provider === 'nontonanimeid'
+        ? 'slug_nontonanimeid'
+        : 'slug_animasu'
 
   const { data, error } = await supabase.from(TABLE).select('*').eq(column, slug).maybeSingle()
 
@@ -172,6 +177,7 @@ export async function upsertMapping(payload: {
   titleMain: string
   slugSamehadaku?: string | null
   slugAnimasu?: string | null
+  slugNontonanimeid?: string | null
   phashV1?: string | null
   releaseYear?: number | null
   totalEpisodes?: number | null
@@ -181,6 +187,7 @@ export async function upsertMapping(payload: {
     p_title_main: payload.titleMain,
     p_slug_samehadaku: payload.slugSamehadaku ?? null,
     p_slug_animasu: payload.slugAnimasu ?? null,
+    p_slug_nontonanimeid: payload.slugNontonanimeid ?? null,
     p_phash_v1: payload.phashV1 ?? null,
     p_release_year: payload.releaseYear ?? null,
     p_total_episodes: payload.totalEpisodes ?? null,
