@@ -101,9 +101,13 @@ export async function generatePHash(imageUrl: string): Promise<PHash | null> {
     Logger.debug(`🖼️  Generating pHash for: ${imageUrl}`)
 
     // 1. Download image as raw binary into an ArrayBuffer — stays in RAM
+    //    maxContentLength + maxBodyLength guard against slow-drip CDN responses
+    //    that keep the connection alive without triggering axios timeout.
     const response = await axios.get<ArrayBuffer>(imageUrl, {
       responseType: 'arraybuffer',
-      timeout: 15_000,
+      timeout: 10_000,
+      maxContentLength: 10 * 1024 * 1024, // 10 MB max
+      maxBodyLength: 10 * 1024 * 1024,
       headers: { 'User-Agent': DEFAULT_USER_AGENT },
     })
 
@@ -111,11 +115,20 @@ export async function generatePHash(imageUrl: string): Promise<PHash | null> {
 
     // 2. Resize to GRID_SIZE×GRID_SIZE, convert to grayscale, get raw pixels
     //    sharp processes entirely in memory — no temp files created.
-    const { data: pixels, info } = await sharp(imageBuffer)
-      .resize(GRID_SIZE, GRID_SIZE, { fit: 'fill' })
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true })
+    //    Wrap in a timeout race — sharp can hang on corrupt/truncated buffers.
+    const sharpTimeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => {
+        reject(new Error('sharp processing timeout'))
+      }, 10_000)
+    })
+    const { data: pixels, info } = await Promise.race([
+      sharp(imageBuffer)
+        .resize(GRID_SIZE, GRID_SIZE, { fit: 'fill' })
+        .grayscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true }),
+      sharpTimeout,
+    ])
 
     const pixelArray = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength)
 

@@ -314,12 +314,12 @@ async function searchProviderForSlug(
 
     // Animasu: .bs cards
     // Samehadaku: .animpost on search pages
-    // NontonAnimeid: article.animeseries cards (slug under /anime/{slug}/)
+    // NontonAnimeid: a.as-anime-card on search pages (different from homepage article.animeseries)
     let cardSelector: string
     if (targetProvider === 'animasu') {
       cardSelector = '.bs'
     } else if (targetProvider === 'nontonanimeid') {
-      cardSelector = 'article.animeseries'
+      cardSelector = 'a.as-anime-card'
     } else {
       cardSelector = '.animpost'
     }
@@ -332,10 +332,12 @@ async function searchProviderForSlug(
       let cardTitle = ''
 
       if (targetProvider === 'nontonanimeid') {
-        // NontonAnimeid: a[href] → /anime/{slug}/, img[src], h3.title span
-        href = $el.find('a[href]').first().attr('href') ?? ''
+        // NontonAnimeid search results use a.as-anime-card (different from homepage article.animeseries)
+        // The card itself is the <a> element: href="/anime/{slug}/"
+        // Title: h3.as-anime-title, Image: img[src]
+        href = $el.attr('href') ?? ''
         img = $el.find('img').first().attr('src') ?? ''
-        cardTitle = $el.find('h3.title span').first().text().trim()
+        cardTitle = $el.find('h3.as-anime-title').first().text().trim()
         // Slug is in /anime/{slug}/ path
         try {
           const urlObj = new URL(href)
@@ -712,7 +714,12 @@ async function discoverOppositeSlug(
     }
   }
 
-  const directScraper = targetProvider === 'animasu' ? scrapeAnimasuDetail : scrapeSamehadakuDetail
+  const directScraper =
+    targetProvider === 'animasu'
+      ? scrapeAnimasuDetail
+      : targetProvider === 'nontonanimeid'
+        ? scrapeNontonAnimeidDetail
+        : scrapeSamehadakuDetail
 
   for (const directSlug of directSlugs) {
     Logger.debug(`  Direct hit attempt: ${targetProvider}/${directSlug}`)
@@ -884,11 +891,22 @@ async function runDiscovery(
     const jikanResult = await searchByTitle(cleanedTitle, detail.year)
 
     if (jikanResult !== null) {
-      const isExact =
-        AnimeNormalizer.calculateSimilarity(
-          AnimeNormalizer.normaliseSeason(cleanedTitle),
-          AnimeNormalizer.normaliseSeason(AnimeNormalizer.cleanTitle(jikanResult.title))
-        ) >= TITLE_SIMILARITY_THRESHOLD
+      // isExact: check similarity against ALL Jikan title variants (romaji + english).
+      // A score ≥ threshold on ANY variant counts — the Jikan match may have been
+      // found via title_english (e.g. "Golden Kamuy Final Season") while title is
+      // romaji ("Golden Kamuy: Saishuushou"), which would score low against the
+      // scraped title and incorrectly fail the gate.
+      const normScrapedTitle = AnimeNormalizer.normaliseSeason(cleanedTitle)
+      const jikanTitleVariants = [jikanResult.title, jikanResult.title_english].filter(
+        (t): t is string => t !== null && t.length > 0
+      )
+      const isExact = jikanTitleVariants.some(
+        (variant) =>
+          AnimeNormalizer.calculateSimilarity(
+            normScrapedTitle,
+            AnimeNormalizer.normaliseSeason(AnimeNormalizer.cleanTitle(variant))
+          ) >= TITLE_SIMILARITY_THRESHOLD
+      )
 
       const metaOk = validateMetadataMatch(
         jikanResult,
