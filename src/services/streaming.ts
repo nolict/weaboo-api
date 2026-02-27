@@ -8,6 +8,7 @@ import { fetchHTML } from '../utils/fetcher'
 import { Logger } from '../utils/logger'
 
 import { buildStreamUrl, triggerHfSpaceWebhook } from './cfWorkers'
+import { getEpisodeUrl } from './episodes'
 import { resolveEmbedUrl } from './resolver'
 
 // ── Streaming cache ───────────────────────────────────────────────────────────
@@ -93,8 +94,17 @@ async function scrapeAnimasuStreaming(
   slug: string,
   episode: number
 ): Promise<StreamingServer[] | null> {
-  const episodeUrl = `${PROVIDERS.ANIMASU.baseUrl}/nonton-${slug}-episode-${episode}/`
-  Logger.debug(`📡 Scraping Animasu streaming: ${episodeUrl}`)
+  // First try to get the real episode URL from the episode list (DOM-scraped, always correct).
+  // The stored slug_animasu may be a canonical/shortened form (e.g. "mf-ghost-s3") that
+  // doesn't match Animasu's actual URL slug (e.g. "mf-ghost-season-3").
+  // Falling back to the constructed URL ensures streaming works even when the DB slug differs.
+  const realUrl = await getEpisodeUrl(slug, PROVIDERS.ANIMASU.name, episode)
+  const episodeUrl = realUrl ?? `${PROVIDERS.ANIMASU.baseUrl}/nonton-${slug}-episode-${episode}/`
+  if (realUrl !== null) {
+    Logger.debug(`📡 Scraping Animasu streaming (URL from episode list): ${episodeUrl}`)
+  } else {
+    Logger.debug(`📡 Scraping Animasu streaming (constructed URL): ${episodeUrl}`)
+  }
 
   try {
     const res = await fetch(episodeUrl, {
@@ -189,8 +199,14 @@ interface ShkPageData {
 }
 
 async function fetchShkPageData(slug: string, episode: number): Promise<ShkPageData | null> {
-  const episodeUrl = `${PROVIDERS.SAMEHADAKU.baseUrl}/${slug}-episode-${episode}/`
-  Logger.debug(`📡 Fetching Samehadaku episode page: ${episodeUrl}`)
+  // Use the real episode URL from the episode list if available (same slug-mismatch fix as Animasu)
+  const realUrl = await getEpisodeUrl(slug, PROVIDERS.SAMEHADAKU.name, episode)
+  const episodeUrl = realUrl ?? `${PROVIDERS.SAMEHADAKU.baseUrl}/${slug}-episode-${episode}/`
+  if (realUrl !== null) {
+    Logger.debug(`📡 Fetching Samehadaku episode page (URL from episode list): ${episodeUrl}`)
+  } else {
+    Logger.debug(`📡 Fetching Samehadaku episode page (constructed URL): ${episodeUrl}`)
+  }
 
   try {
     const html = await fetchHTML(episodeUrl, 30000)

@@ -63,7 +63,8 @@ function buildJikanQueries(rawTitle: string): string[] {
   const seen = new Set<string>()
 
   const add = (q: string): void => {
-    const trimmed = q.trim()
+    // Always clean each query to strip punctuation/quote variants before sending to Jikan
+    const trimmed = AnimeNormalizer.cleanTitle(q)
     if (trimmed.length > 0 && !seen.has(trimmed)) {
       seen.add(trimmed)
       queries.push(trimmed)
@@ -83,6 +84,21 @@ function buildJikanQueries(rawTitle: string): string[] {
 
   // 3. normaliseSeason form — canonical "part N" wording
   add(AnimeNormalizer.normaliseSeason(rawTitle))
+
+  // 4. Short prefix fallback for very long titles — Jikan search handles short
+  //    queries better than 100+ char strings. Take first 4 words (≥10 chars total)
+  //    to get a meaningful but concise query.
+  //    e.g. "Omae Gotoki ga Maou ni Kateru to Omouna to Yuusha Party..." → "Omae Gotoki ga Maou"
+  //    Also try pre-colon portion for titles like "Hell's Paradise: Jigokuraku"
+  const colonIdx = rawTitle.indexOf(':')
+  if (colonIdx > 0) {
+    add(rawTitle.slice(0, colonIdx).trim())
+  }
+
+  const firstFourWords = rawTitle.split(/\s+/).slice(0, 4).join(' ')
+  if (firstFourWords.length >= 10) {
+    add(firstFourWords)
+  }
 
   return queries
 }
@@ -106,7 +122,9 @@ function scoreCandidate(normalisedQuery: string, candidate: JikanAnime): number 
 
   let maxSim = 0
   for (const variant of variants) {
-    const normVariant = AnimeNormalizer.normaliseSeason(variant)
+    // Clean variant before comparing — MAL titles can have curly quotes/punctuation
+    // (e.g. '"Omae Gotoki..."') that differ from our cleaned query → false low score
+    const normVariant = AnimeNormalizer.normaliseSeason(AnimeNormalizer.cleanTitle(variant))
     const sim = AnimeNormalizer.calculateSimilarity(normalisedQuery, normVariant)
 
     // Prefix match: query is a prefix of variant or vice-versa
@@ -150,8 +168,9 @@ export async function searchByTitle(
 ): Promise<JikanAnime | null> {
   try {
     const queries = buildJikanQueries(rawTitle)
-    // normaliseSeason form of the raw title — used for scoring regardless of which query found hits
-    const normalisedRaw = AnimeNormalizer.normaliseSeason(rawTitle)
+    // Clean + normaliseSeason for scoring — ensures punctuation/quote variants
+    // don't pollute the similarity comparison against Jikan candidates.
+    const normalisedRaw = AnimeNormalizer.normaliseSeason(AnimeNormalizer.cleanTitle(rawTitle))
 
     let bestMatch: JikanAnime | null = null
     let bestScore = 0

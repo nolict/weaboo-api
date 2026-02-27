@@ -340,11 +340,12 @@ async function discoverOppositeSlug(
   for (let qIdx = 0; qIdx < queryTitles.length; qIdx++) {
     const query = queryTitles[qIdx]
 
-    // For Samehadaku: when the query is the romaji/full title (index ≥ 2 in query list,
-    // i.e. the more specific queries), trust the search engine if ≤ 3 results come back —
-    // Samehadaku indexes by full title so even short-slug entries will appear.
-    // In this case we skip the card title pre-filter and go straight to detail scrape.
-    const isSpecificRomajiQuery = targetProvider === 'samehadaku' && qIdx >= 2
+    // For Samehadaku: trust the search engine if ≤ 3 results come back — Samehadaku
+    // indexes by full title so even short-slug entries (e.g. "omae-gotoki-ga-maou...")
+    // will appear. Skip card-title pre-filter and go straight to detail scrape.
+    // Previously this was only for qIdx ≥ 2 but even q[0] (full title) returns the
+    // right result on Samehadaku when there are few candidates.
+    const isSpecificRomajiQuery = targetProvider === 'samehadaku'
     const candidates = await searchProviderForSlug(query, targetProvider, isSpecificRomajiQuery)
 
     for (const candidate of candidates) {
@@ -524,6 +525,25 @@ async function discoverOppositeSlug(
       .trim()
     const baseSlug = AnimeNormalizer.createCanonicalSlug(baseTitle)
     addDirectSlug(baseSlug)
+
+    // Truncated slug variants — some providers (especially Samehadaku) use
+    // shortened slugs cut at logical title separators.
+    // Light novel titles often use " to " or " node " as separators:
+    // e.g. "Omae Gotoki ga Maou ni Kateru to Omouna" to Yuusha Party..."
+    //   → Samehadaku slug: "omae-gotoki-ga-maou-ni-kateru-to-omouna"
+    // Try slug forms cut at common LN title separator words.
+    const cleanedT = AnimeNormalizer.cleanTitle(t)
+    const lnSeparators = [' node ', ' to ', ' ga ', ' de ', ' ni ', ' wo ']
+    for (const sep of lnSeparators) {
+      const sepIdx = cleanedT.toLowerCase().lastIndexOf(sep)
+      if (sepIdx > 10) {
+        // Only cut if there's meaningful content before the separator
+        const prefix = cleanedT.slice(0, sepIdx).trim()
+        if (prefix.split(/\s+/).length >= 3) {
+          addDirectSlug(AnimeNormalizer.createCanonicalSlug(prefix))
+        }
+      }
+    }
 
     // Season slug variants — append known season suffixes to base slug
     // e.g. "jigokuraku" + "-season-2" → "jigokuraku-season-2"
@@ -712,7 +732,7 @@ async function runDiscovery(
       const isExact =
         AnimeNormalizer.calculateSimilarity(
           AnimeNormalizer.normaliseSeason(cleanedTitle),
-          AnimeNormalizer.normaliseSeason(jikanResult.title)
+          AnimeNormalizer.normaliseSeason(AnimeNormalizer.cleanTitle(jikanResult.title))
         ) >= TITLE_SIMILARITY_THRESHOLD
 
       const metaOk = validateMetadataMatch(

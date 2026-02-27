@@ -33,13 +33,23 @@ export const AnimeNormalizer = {
   },
 
   cleanTitle(title: string): string {
-    return title
-      .replace(/\s*\(.*?\)\s*/g, '')
-      .replace(/\s*-\s*sub\s*indo?\s*/gi, '')
-      .replace(/\s*sub\s*indo?\s*/gi, '')
-      .replace(/\s*batch\s*/gi, '')
-      .replace(/nonton\s*anime\s*/gi, '')
-      .trim()
+    return (
+      title
+        .replace(/\s*\(.*?\)\s*/g, '')
+        .replace(/\s*-\s*sub\s*indo?\s*/gi, '')
+        .replace(/\s*sub\s*indo?\s*/gi, '')
+        .replace(/\s*batch\s*/gi, '')
+        .replace(/nonton\s*anime\s*/gi, '')
+        // Normalise punctuation variants so that "?" and """ and "!" don't
+        // create Levenshtein distance vs MAL titles that use different quote styles.
+        // e.g. "?Omae Gotoki...?" vs ""Omae Gotoki..."" → both become "Omae Gotoki..."
+        .replace(
+          /[\u0022\u201C\u201D\u2018\u2019\u300C\u300D\u300E\u300F\u3010\u3011\u3008\u3009\u300A\u300B\u003F\uFF01!]/g,
+          ''
+        )
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
   },
 
   calculateSimilarity(str1: string, str2: string): number {

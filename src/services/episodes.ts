@@ -236,3 +236,25 @@ export async function getEpisodeList(
     samehadaku: samehadakuEpisodes,
   }
 }
+
+/**
+ * getEpisodeUrl — Returns the direct URL for a specific episode number from
+ * the episode list of a provider. Uses the cached episode list (fetching if
+ * needed). Returns null if the episode is not found.
+ *
+ * This is used by the streaming service to get the real episode URL from the
+ * DOM (which always has the correct slug), rather than constructing it from
+ * the stored mapping slug (which may be canonical/shortened and not match).
+ */
+export async function getEpisodeUrl(
+  slug: string,
+  provider: string,
+  episode: number
+): Promise<string | null> {
+  const episodes = await getEpisodesForProvider(slug, provider)
+  if (episodes === null) return null
+
+  // Find entry where the target episode falls within the range
+  const entry = episodes.find((e) => episode >= e.episodeStart && episode <= e.episodeEnd)
+  return entry?.url ?? null
+}
